@@ -14,6 +14,21 @@ from .compressor import ContextCompressor
 logger = logging.getLogger(__name__)
 
 
+def _skip_leading_tool_messages(
+    messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Drop any leading orphaned ``role="tool"`` messages.
+
+    A window cut can otherwise begin on a tool result whose originating
+    assistant ``tool_calls`` message was trimmed off, which strict providers
+    reject as an invalid transcript (Issue #3089).
+    """
+    start = 0
+    while start < len(messages) and messages[start].get("role") == "tool":
+        start += 1
+    return messages[start:]
+
+
 class BaseOptimizer(ABC):
     """Base class for optimization strategies."""
     
@@ -71,8 +86,9 @@ class TruncateOptimizer(BaseOptimizer):
             else:
                 other_msgs.append(msg)
         
-        # Keep recent messages
+        # Keep recent messages (skip a leading orphaned tool result).
         recent = other_msgs[-self.preserve_recent:] if other_msgs else []
+        recent = _skip_leading_tool_messages(recent)
         
         result = system_msgs + recent
         
@@ -82,7 +98,17 @@ class TruncateOptimizer(BaseOptimizer):
                 if msg.get("role") != "system":
                     result.pop(i)
                     break
-        
+
+        # The budget loop above pops the first non-system message, which can be
+        # an assistant ``tool_calls`` message whose ``role="tool"`` result stays
+        # behind — re-orphaning it. Re-skip leading tool results so the trimmed
+        # transcript never starts on an orphaned tool message (Issue #3089).
+        system_msgs = [m for m in result if m.get("role") == "system"]
+        other_msgs = _skip_leading_tool_messages(
+            [m for m in result if m.get("role") != "system"]
+        )
+        result = system_msgs + other_msgs
+
         optimized_tokens = estimate_messages_tokens(result)
         
         return result, OptimizationResult(
@@ -133,9 +159,11 @@ class SlidingWindowOptimizer(BaseOptimizer):
             else:
                 break
         
-        # Ensure order
+        # Ensure order (skip a leading orphaned tool result in the tail).
         system_msgs = [m for m in result if m.get("role") == "system"]
-        other_msgs = [m for m in result if m.get("role") != "system"]
+        other_msgs = _skip_leading_tool_messages(
+            [m for m in result if m.get("role") != "system"]
+        )
         result = system_msgs + other_msgs
         
         optimized_tokens = estimate_messages_tokens(result)
@@ -1080,6 +1108,18 @@ def get_optimizer(
         Optimizer instance
     """
     optimizer_class = OPTIMIZER_REGISTRY.get(strategy, SmartOptimizer)
+
+    # Optimizers do not share a constructor signature. Callers (e.g. the
+    # ContextManager) pass the union of every optimizer's kwargs, so filter to
+    # the ones this class actually accepts; otherwise all but SmartOptimizer
+    # raise TypeError and context management is silently disabled upstream.
+    import inspect
+    params = inspect.signature(optimizer_class.__init__).parameters
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    if not accepts_var_kw:
+        kwargs = {k: v for k, v in kwargs.items() if k in params}
     return optimizer_class(**kwargs)
 
 

@@ -30,6 +30,7 @@ Methods:
 
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">aclose</a>() -> None</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">add_mcp_server</a>(name: str, mcp: Any) -> Any</code>
+* <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">add_verification</a>(hook: Any) -> None</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">agent_id</a>() -> str</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">analyze_prompt</a>(prompt: str) -> set</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">auto_memory</a>() -> Optional[bool]</code>
@@ -70,6 +71,7 @@ Methods:
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">redo</a>() -> bool</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">refresh_tools</a>() -> List[Any]</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">remove_mcp_server</a>(name: str) -> bool</code>
+* <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">remove_verification</a>(name: str) -> bool</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">retrieval_config</a>() -> Optional[Any]</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">retrieve</a>(query: str, **kwargs) -> 'ContextPack'</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">rules_manager</a>() -> Optional[Any]</code>
@@ -238,10 +240,12 @@ from praisonaiagents import Memory, MemoryBackend, MemoryConfig
 
 Methods:
 
+* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">acommit_memory_batch</a>(writes: List[tuple]) -> None</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">build_cache_optimized_context</a>(task_descr: str, user_id: Optional[str] = None, additional: str = '', max_items: int = 3, include_cache_boundary: bool = True, include_in_output: Optional[bool] = None) -> Dict[str, str]</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">build_context_for_task</a>(task_descr: str, user_id: Optional[str] = None, additional: str = '', max_items: int = 3, include_in_output: Optional[bool] = None) -> str</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">calculate_quality_metrics</a>(output: str, expected_output: str, llm: Optional[str] = None, custom_prompt: Optional[str] = None) -> Dict[str, float]</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">close_connections</a>()</code>
+* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">commit_memory_batch</a>(writes: List[tuple]) -> None</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">compute_quality_score</a>(completeness: float, relevance: float, clarity: float, accuracy: float, weights: Dict[str, float] = None) -> float</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">delete_long_term</a>(memory_id: str) -> bool</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">delete_memories</a>(memory_ids: List[str]) -> int</code>
@@ -251,6 +255,7 @@ Methods:
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">finalize_task_output</a>(content: str, agent_name: str, quality_score: float, threshold: float = 0.7, metrics: Dict[str, Any] = None, task_id: str = None)</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">forget</a>(**kwargs) -> int</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">get_all_memories</a>() -> List[Dict[str, Any]]</code>
+* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">get_context</a>(query: Optional[str] = None, **kwargs) -> str</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">get_learn_context</a>() -> str</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">learn</a>()</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">recall</a>(query: str, **kwargs) -> List[Dict[str, Any]]</code>
@@ -744,7 +749,7 @@ Methods:
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_token_usage_summary</a>() -> Dict[str, Any]</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">has_state</a>(key: str) -> bool</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">increment_state</a>(key: str, amount: float = 1, default: float = 0) -> float</code>
-* <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">launch</a>(path: str = '/agents', port: int = 8000, host: str = '0.0.0.0', debug: bool = False, protocol: str = 'http')</code>
+* <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">launch</a>(path: str = '/agents', port: int = 8000, host: str = '127.0.0.1', debug: bool = False, protocol: str = 'http')</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">restore_session_state</a>(session_id: str) -> bool</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">run</a>(content = None, return_dict = False, **kwargs)</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">run_all_tasks</a>()</code>
@@ -878,6 +883,7 @@ Methods:
 * <code title="cli">praisonai recipe list <a href="./src/praisonai/praisonai/cli/commands/recipe.py">--help</a></code>
 * <code title="cli">praisonai recipe optimize <a href="./src/praisonai/praisonai/cli/commands/recipe.py">--help</a></code>
 * <code title="cli">praisonai recipe run <a href="./src/praisonai/praisonai/cli/commands/recipe.py">--help</a></code>
+* <code title="cli">praisonai recipe runs <a href="./src/praisonai/praisonai/cli/commands/recipe.py">--help</a></code>
 * <code title="cli">praisonai recipe serve <a href="./src/praisonai/praisonai/cli/commands/recipe.py">--help</a></code>
 * <code title="cli">praisonai replay cleanup <a href="./src/praisonai/praisonai/cli/commands/replay.py">--help</a></code>
 * <code title="cli">praisonai replay context <a href="./src/praisonai/praisonai/cli/commands/replay.py">--help</a></code>
@@ -894,7 +900,11 @@ Methods:
 * <code title="cli">praisonai schedule describe <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule list <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule logs <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
+* <code title="cli">praisonai schedule pause <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
+* <code title="cli">praisonai schedule remove <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule restart <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
+* <code title="cli">praisonai schedule resume <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
+* <code title="cli">praisonai schedule runs <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule schedule-callback <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule start <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule stats <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
@@ -903,6 +913,7 @@ Methods:
 * <code title="cli">praisonai schedule suggestion-dismiss <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule suggestion-propose <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule suggestions <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
+* <code title="cli">praisonai schedule update <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai validate check <a href="./src/praisonai/praisonai/cli/commands/validate.py">--help</a></code>
 * <code title="cli">praisonai validate schema <a href="./src/praisonai/praisonai/cli/commands/validate.py">--help</a></code>
 * <code title="cli">praisonai validate validate <a href="./src/praisonai/praisonai/cli/commands/validate.py">--help</a></code>

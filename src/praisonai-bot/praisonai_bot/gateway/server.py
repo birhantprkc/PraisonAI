@@ -15,7 +15,6 @@ import re
 import secrets
 import time
 import uuid
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
@@ -45,6 +44,8 @@ from praisonaiagents.gateway.protocols import (
     MIN_CLIENT_PROTOCOL_VERSION,
     ReloadStatus,
     compute_config_revision,
+    HealthPressure,
+    evaluate_pressure,
 )
 from praisonaiagents.session.protocols import SessionStoreProtocol
 from praisonaiagents.session.store import DefaultSessionStore
@@ -1084,15 +1085,22 @@ class WebSocketGateway:
         # surfaces that start an agent run from an external event. Routes are
         # mounted dynamically when the server starts.
         self._hooks: Dict[str, Any] = {}  # path -> HookConfig
-        # Bounded idempotency store: dedup key -> insertion time (seconds).
-        self._hook_idempotency: "OrderedDict[str, float]" = OrderedDict()
+        # Inbound webhook/trigger dedup store (#4208). Built lazily via
+        # ``_hook_idem`` from the ``hooks.idempotency.store_backend`` config
+        # knob: ``"memory"`` (default, per-process) or ``"sqlite"`` (durable,
+        # survives a restart within a provider's retry window). The store
+        # implements the core ``IdempotencyStoreProtocol`` reserve/record/release
+        # contract; the durable backend makes the atomic "already seen or in
+        # flight" claim a crash-safe ``UNIQUE`` insert.
+        self._hook_idem: Any = None
         self._hook_idempotency_max = 10_000
         self._hook_idempotency_ttl = 86_400.0  # 24h
-        # Keys currently being processed. Used to deduplicate *concurrent*
-        # identical deliveries: the idempotency store is only written after a
-        # run succeeds, so without this set two simultaneous requests would both
-        # pass the seen-check across the ``await`` and run the agent twice.
-        self._hook_inflight: set = set()
+        # Backend selected by ``hooks.idempotency.store_backend`` in the parsed
+        # YAML (``"memory"`` default, ``"sqlite"`` for restart durability). It is
+        # captured in ``_apply_hooks_from_config`` — the only path that sees the
+        # raw ``hooks`` dict — because ``GatewayConfig`` carries no idempotency
+        # field. ``None`` until a config with a ``hooks:`` block is applied.
+        self._hook_idempotency_backend: Optional[str] = None
 
         # Issue #3021: opt-in gateway lifecycle — idle/scale-to-zero, epoch-aware
         # external drain marker, and a crash-loop restart guard. These reuse the
@@ -2916,6 +2924,10 @@ class WebSocketGateway:
                     EventType.TOOL_PROGRESS_STREAM.value,
                     EventType.STREAM_ERROR.value,
                     EventType.STREAM_END.value,
+                    EventType.MODEL_FALLBACK_STREAM.value,
+                    EventType.RETRY_STREAM.value,
+                    EventType.TODO_STREAM.value,
+                    EventType.TOOL_RESULT_STREAM.value,
                 ])
             
             # Add optional features based on client capabilities
@@ -3592,11 +3604,36 @@ class WebSocketGateway:
                         "error": getattr(event, 'error', None),
                         "session_id": sid,
                     }
+                elif event_type == StreamEventType.MODEL_FALLBACK:
+                    gw_type = EventType.MODEL_FALLBACK_STREAM
+                    data = {
+                        "metadata": getattr(event, 'metadata', None),
+                        "session_id": sid,
+                    }
+                elif event_type == StreamEventType.RETRY:
+                    gw_type = EventType.RETRY_STREAM
+                    data = {
+                        "metadata": getattr(event, 'metadata', None),
+                        "session_id": sid,
+                    }
+                elif event_type == StreamEventType.TODO_UPDATED:
+                    gw_type = EventType.TODO_STREAM
+                    data = {
+                        "metadata": getattr(event, 'metadata', None),
+                        "session_id": sid,
+                    }
+                elif event_type == StreamEventType.TOOL_CALL_RESULT:
+                    gw_type = EventType.TOOL_RESULT_STREAM
+                    data = {
+                        "tool_call": getattr(event, 'tool_call', {}),
+                        "metadata": getattr(event, 'metadata', None),
+                        "session_id": sid,
+                    }
                 elif event_type == StreamEventType.STREAM_END:
                     gw_type = EventType.STREAM_END
                     data = {"session_id": sid}
                 else:
-                    return  # Skip non-forwarded events
+                    return  # Skip genuinely internal markers
 
                 gw_event = GatewayEvent(
                     type=gw_type,
@@ -3859,6 +3896,10 @@ class WebSocketGateway:
                     "reasoning_stream",
                     "tool_progress_stream",
                     "stream_error",
+                    "model_fallback_stream",
+                    "retry_stream",
+                    "todo_stream",
+                    "tool_result_stream",
                 ]:
                     session_id = self._client_sessions.get(client_id)
                     if session_id:
@@ -4151,49 +4192,95 @@ class WebSocketGateway:
         hooks_cfg = cfg.get("hooks")
         if hooks_cfg is None:
             hooks_cfg = cfg.get("gateway", {}).get("hooks")
+
+        # Capture the inbound dedup backend (#4208). ``hooks`` is normally a list
+        # of hook entries, so the ``idempotency`` knob lives as a sibling
+        # (``hooks_idempotency``/``idempotency``); a mapping-shaped ``hooks:``
+        # block may instead nest it under ``hooks.idempotency``. Support both,
+        # then invalidate any store already built under the old backend so a
+        # hot-reload that flips ``memory``↔``sqlite`` takes effect.
+        idem_cfg: Any = None
+        if isinstance(hooks_cfg, dict):
+            idem_cfg = hooks_cfg.get("idempotency")
+            entries = hooks_cfg.get("hooks", [])
+        else:
+            entries = hooks_cfg
+        if idem_cfg is None:
+            idem_cfg = cfg.get("hooks_idempotency") or cfg.get("idempotency")
+            if idem_cfg is None:
+                idem_cfg = cfg.get("gateway", {}).get("hooks_idempotency")
+        backend: Optional[str] = None
+        if isinstance(idem_cfg, dict):
+            backend = idem_cfg.get("store_backend")
+        elif isinstance(idem_cfg, str):
+            backend = idem_cfg
+        if backend is not None:
+            backend = str(backend)
+        if backend != self._hook_idempotency_backend:
+            self._hook_idempotency_backend = backend
+            self._hook_idem = None  # rebuild lazily under the new backend
+
         self._hooks.clear()
-        if hooks_cfg:
-            self._register_hooks_from_config(hooks_cfg)
+        if entries:
+            self._register_hooks_from_config(entries)
+
+    def _get_hook_idem_store(self) -> Any:
+        """Build (once) and return the inbound idempotency store (#4208).
+
+        Backend is selected by ``hooks.idempotency.store_backend`` on the gateway
+        config (``"memory"`` default, ``"sqlite"`` for restart durability). The
+        durable SQLite store reuses the gateway's state dir, exactly as the
+        ingress journal and outbound queue do. Falls back to the in-memory
+        default on any build failure so inbound delivery keeps working.
+        """
+        if self._hook_idem is not None:
+            return self._hook_idem
+        # Backend is captured from the parsed ``hooks.idempotency`` config in
+        # ``_apply_hooks_from_config`` (``GatewayConfig`` carries no field for
+        # it). Default to the in-memory store when no config selected one.
+        backend = self._hook_idempotency_backend or "memory"
+        try:
+            from pathlib import Path
+            from praisonai_bot.bots import build_idempotency_store
+
+            self._hook_idem = build_idempotency_store(
+                backend,
+                path=Path.home() / ".praisonai" / "state" / "hook_idempotency.sqlite",
+                max_size=self._hook_idempotency_max,
+                ttl_seconds=self._hook_idempotency_ttl,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            from praisonaiagents.gateway import InMemoryIdempotencyStore
+
+            logger.debug(
+                "build_idempotency_store unavailable, using in-memory dedup: %s", e
+            )
+            self._hook_idem = InMemoryIdempotencyStore(
+                max_entries=self._hook_idempotency_max,
+                ttl_seconds=self._hook_idempotency_ttl,
+            )
+        return self._hook_idem
 
     def _hook_reserve(self, key: str) -> bool:
         """Atomically claim ``key`` for processing.
 
         Returns ``True`` when the caller may proceed, ``False`` when the key was
         already recorded *or* is currently being processed by a concurrent
-        request. This check-and-reserve runs entirely synchronously (no
-        ``await``), so on the single-threaded event loop it is atomic and closes
-        the time-of-check/time-of-use race between the seen-check and the
-        deferred :meth:`_hook_record`.
+        request. Delegates to the configured :class:`IdempotencyStoreProtocol`
+        store, whose durable backend makes the claim survive a restart.
 
         On a falsy outcome the caller must release the reservation via
         :meth:`_hook_release`; on success it must call :meth:`_hook_record`.
-        Expired entries are pruned lazily here.
         """
-        now = time.time()
-        store = self._hook_idempotency
-        # Prune expired entries lazily.
-        if store:
-            ttl = self._hook_idempotency_ttl
-            expired = [k for k, ts in store.items() if now - ts > ttl]
-            for k in expired:
-                store.pop(k, None)
-        if key in store or key in self._hook_inflight:
-            return False
-        self._hook_inflight.add(key)
-        return True
+        return self._get_hook_idem_store().reserve(key)
 
     def _hook_release(self, key: str) -> None:
         """Release an in-flight reservation so the delivery can be retried."""
-        self._hook_inflight.discard(key)
+        self._get_hook_idem_store().release(key)
 
     def _hook_record(self, key: str) -> None:
-        """Record ``key`` as processed. Bounded so the store cannot grow unboundedly."""
-        self._hook_inflight.discard(key)
-        store = self._hook_idempotency
-        store[key] = time.time()
-        # Enforce max size (drop oldest).
-        while len(store) > self._hook_idempotency_max:
-            store.popitem(last=False)
+        """Record ``key`` as processed after a successful run."""
+        self._get_hook_idem_store().record(key)
 
     async def _run_hook(self, hook: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a hook: resolve session, run agent (or wake), deliver.
@@ -4207,7 +4294,10 @@ class WebSocketGateway:
         # zero-cost, sub-second notification forwarding. Independent of
         # ``action`` so it composes with either.
         if getattr(hook, "deliver_only", False):
-            message = hook.resolve_message(payload) or ""
+            # No agent consumes this turn — the rendered message is delivered
+            # verbatim to the channel. Skip the untrusted-request fence so the
+            # recipient never sees literal ``<external_request_payload>`` markup.
+            message = hook.resolve_message(payload, fence=False) or ""
             if not hook.deliver_to:
                 return {
                     "ok": False,
@@ -4789,6 +4879,112 @@ class WebSocketGateway:
                 )
         except Exception as e:  # pragma: no cover — defensive
             logger.debug("supervision metric mirror failed: %s", e)
+        # Issue #4265: mirror the saturation/back-pressure facts the enforcement
+        # layer already tracks (admission counters, outbound backlog, event-loop
+        # lag) so ``/metrics`` gains the forward overload signal it was missing.
+        try:
+            pressure = self._compute_pressure()
+            if pressure is not None:
+                self._metrics.set_gauge(
+                    "admission_in_flight", float(pressure.admission_in_flight)
+                )
+                self._metrics.set_gauge(
+                    "admission_queued", float(pressure.admission_queued)
+                )
+                self._metrics.set_gauge(
+                    "inbox_pending", float(pressure.inbox_pending)
+                )
+                self._metrics.set_gauge(
+                    "outbox_pending", float(pressure.outbox_pending)
+                )
+                self._metrics.set_gauge(
+                    "outbox_dead_letter", float(pressure.outbox_dead_letter)
+                )
+                self._metrics.set_gauge(
+                    "event_loop_lag_ms", float(pressure.event_loop_lag_p99_ms)
+                )
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("pressure metric mirror failed: %s", e)
+
+    def _inbox_pending_total(self) -> int:
+        """Aggregate pending inbound queue depth across all sessions.
+
+        Issue #4265: each :class:`GatewaySession` owns an ``_inbox`` queue; the
+        fleet-wide backlog is the sum of their sizes — a forward saturation
+        signal that inbound work is arriving faster than it drains.
+        """
+        total = 0
+        for session in self._sessions.values():
+            inbox = getattr(session, "_inbox", None)
+            if inbox is None:
+                continue
+            try:
+                total += int(inbox.qsize())
+            except Exception:  # pragma: no cover — defensive
+                continue
+        return total
+
+    def _compute_pressure(self) -> Optional[HealthPressure]:
+        """Read back the gateway's saturation state as a :class:`HealthPressure`.
+
+        Issue #4265: the back-pressure enforcement layer (admission gate,
+        durable outbox, loop watchdog) already computes exactly how loaded the
+        gateway is; this reads those facts and folds them through the pure core
+        classifier. Returns ``None`` only when no back-pressure machinery is
+        wired. Best-effort: any per-source failure degrades to a zero for that
+        source rather than raising into the health/metrics path.
+        """
+        gate = getattr(self, "_admission_gate", None)
+        watchdog = self._watchdog
+        outbox = self._scheduled_outbox
+        if gate is None and watchdog is None and outbox is None:
+            return None
+
+        admission_stats: Dict[str, Any] = {}
+        if gate is not None:
+            try:
+                admission_stats = gate.stats()
+            except Exception:  # pragma: no cover — defensive
+                admission_stats = {}
+
+        try:
+            inbox_pending = self._inbox_pending_total()
+        except Exception:  # pragma: no cover — defensive
+            inbox_pending = 0
+
+        # Read the outbound backlog *without ever blocking the event loop*.
+        # health()/metrics run on the loop, while outbox counts take the
+        # outbox writer lock and hit SQLite; a blocking read issued while a
+        # drain/enqueue holds that lock would wedge all gateway scheduling.
+        # ``try_depth_snapshot`` returns None if the writer lock is contended,
+        # in which case we reuse the last-known depths rather than waiting.
+        outbox_pending, outbox_dead_letter = getattr(
+            self, "_last_outbox_depths", (0, 0)
+        )
+        if outbox is not None:
+            snapshot = None
+            try:
+                snapshot = outbox.try_depth_snapshot()
+            except Exception:  # pragma: no cover — defensive
+                snapshot = None
+            if snapshot is not None:
+                outbox_pending, outbox_dead_letter = snapshot
+                self._last_outbox_depths = snapshot
+
+        loop_lag_ms = 0.0
+        if watchdog is not None:
+            try:
+                loop_lag_ms = float(getattr(watchdog, "last_lag_ms", 0.0) or 0.0)
+            except Exception:  # pragma: no cover — defensive
+                loop_lag_ms = 0.0
+
+        return evaluate_pressure(
+            admission=admission_stats,
+            inbox_pending=inbox_pending,
+            outbox_pending=outbox_pending,
+            outbox_dead_letter=outbox_dead_letter,
+            loop_lag_p99_ms=loop_lag_ms,
+        )
 
     def metrics_snapshot(self) -> Dict[str, Any]:
         """Return a plain-dict snapshot of current metrics (for JSON/tests)."""
@@ -5071,6 +5267,19 @@ class WebSocketGateway:
                         on_disk != self._applied_config_revision
                     )
         
+        # Issue #4265: surface saturation/back-pressure telemetry so overload is
+        # a first-class, forward signal — admission utilisation, inbound/outbound
+        # backlog, event-loop lag and a single derived ``pressure`` class — read
+        # back from the enforcement layer that already tracks it. Only included
+        # when back-pressure machinery is wired, and computed defensively so
+        # health() never raises.
+        try:
+            pressure = self._compute_pressure()
+            if pressure is not None:
+                result["pressure"] = pressure.to_dict()
+        except Exception:
+            pass
+
         # Add push status if enabled (push infra lives in wrapper; guard defensively)
         if getattr(self, "_push_enabled", False):
             push_status: Dict[str, Any] = {"enabled": True}
@@ -5160,8 +5369,13 @@ class WebSocketGateway:
 
     async def _deliver_scheduled_result(
         self, delivery: Any, text: str,
-    ) -> None:
+    ) -> bool:
         """Route a scheduled job result to the correct channel bot.
+
+        Returns whether the payload actually reached the target. Returning
+        ``None`` on every path (issue #4193) made "the handler did not raise"
+        the success signal, so a routing failure was recorded as a successful
+        delivery. ``True`` means delivered, ``False`` means it did not.
 
         Args:
             delivery: A ``DeliveryTarget`` with ``channel`` and ``channel_id``.
@@ -5174,7 +5388,7 @@ class WebSocketGateway:
 
         if not channel or not channel_id:
             logger.warning("Delivery target missing channel or channel_id, skipping")
-            return
+            return False
 
         router = self.delivery_router
         if router is not None:
@@ -5223,7 +5437,7 @@ class WebSocketGateway:
                 logger.error(
                     "Failed to deliver scheduled result to %s:%s", channel, channel_id,
                 )
-            return
+            return bool(delivered)
 
         # Fallback: router unavailable — preserve the prior bare-send behaviour.
         bot = self.get_channel_bot(channel)
@@ -5238,7 +5452,7 @@ class WebSocketGateway:
             logger.warning(
                 "No channel bot '%s' found for scheduled delivery", channel,
             )
-            return
+            return False
 
         try:
             await bot.send_message(
@@ -5253,6 +5467,8 @@ class WebSocketGateway:
             logger.error(
                 "Failed to deliver to %s:%s: %s", channel, channel_id, e,
             )
+            return False
+        return True
 
     def _seed_continuable_session(self, delivery: Any, text: str) -> None:
         """Seed a resumable session so a reply to a delivered brief has context.
@@ -5379,6 +5595,38 @@ class WebSocketGateway:
         # issue #3231); any other status is a genuine miss for this key.
         return outbox.status_for(idem) == "sent"
 
+    def _build_run_policy(self) -> Optional[Any]:
+        """Construct the unattended-run safety policy for scheduled jobs.
+
+        Returns a ``RunPolicy`` with fail-closed defaults (deliver-on-failure,
+        prompt scan, denied toolsets) so scheduled runs are protected out of the
+        box. Optional ``gateway.yaml`` overrides live under a ``scheduler:``
+        block (``deliver_on_failure``, ``denied_toolsets``, ``audit_dir``).
+        Returns ``None`` only when the wrapper policy module is not co-installed,
+        preserving today's no-policy behaviour in that minimal deployment.
+        """
+        try:
+            from praisonai.scheduler.run_policy import (
+                DEFAULT_DENIED_TOOLSETS,
+                RunPolicy,
+            )
+        except ImportError as e:  # pragma: no cover - wrapper not co-installed
+            logger.debug("RunPolicy unavailable, scheduler runs unguarded: %s", e)
+            return None
+
+        cfg = (self._loaded_config or {}).get("scheduler", {}) or {}
+        denied = cfg.get("denied_toolsets")
+        denied_toolsets = (
+            set(denied) if isinstance(denied, (list, tuple, set))
+            else set(DEFAULT_DENIED_TOOLSETS)
+        )
+        return RunPolicy(
+            deliver_on_failure=bool(cfg.get("deliver_on_failure", True)),
+            scan_assembled_prompt=bool(cfg.get("scan_prompt", True)),
+            denied_toolsets=denied_toolsets,
+            audit_dir=cfg.get("audit_dir"),
+        )
+
     def _start_scheduler_tick(self, interval: float = 15.0) -> None:
         """Start a background task that polls the scheduler for due jobs.
 
@@ -5386,6 +5634,7 @@ class WebSocketGateway:
         - a ``ScheduleRunner`` with the canonical default store
         - this gateway's agent registry for resolution
         - ``_deliver_scheduled_result`` for outbound delivery
+        - a default ``RunPolicy`` so unattended runs are guarded
         """
         async def _run():
             try:
@@ -5413,8 +5662,23 @@ class WebSocketGateway:
                 runner=runner,
                 agent_resolver=_resolve_agent,
                 delivery_handler=self._deliver_scheduled_result,
+                run_policy=self._build_run_policy(),
             )
-            await executor.run_loop(interval=interval)
+            # Refresh the policy each tick from the (possibly hot-reloaded)
+            # config so a live change to the ``scheduler:`` block — delivery,
+            # prompt scan, denied toolsets, audit dir — applies on the next tick
+            # without a process restart. ``_build_run_policy`` reads the current
+            # ``_loaded_config``; rebuilding is cheap (a small dataclass) and
+            # keeps a long-lived gateway from pinning stale unattended-run
+            # settings. Falls back to ``run_loop`` when the executor predates
+            # per-tick policy refresh.
+            try:
+                while True:
+                    executor._run_policy = self._build_run_policy()
+                    await executor.tick_all()
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                pass
 
         self._scheduler_task = asyncio.create_task(_run())
         logger.info("Scheduler tick started (interval=15s)")
@@ -5989,21 +6253,61 @@ class WebSocketGateway:
             return default
         return bool(value)
 
-    @staticmethod
-    def _durable_runs_from_config(cfg: Optional[Dict[str, Any]]) -> bool:
-        """Return the gateway-wide durable-runs opt-in (``gateway.durable_runs``).
+    def _durable_store_present(self, gw_cfg: Dict[str, Any]) -> bool:
+        """Whether the *effective* session store is durable (persisted).
 
-        Issue #4028: operators enable durable gateway runs by setting
-        ``gateway.durable_runs: true`` in ``gateway.yaml``. Default-off so
-        existing gateways are unchanged. Individual agents may still override
-        this default via a per-agent ``durable`` key in their config.
+        Sessions persist by default (``persist: true``, ``store: sqlite`` —
+        :class:`SessionConfig`), so the durable store the journal-backed resume
+        needs is normally present out of the box. But :meth:`_build_session_store`
+        degrades to in-memory sessions (``self._session_store is None``) when a
+        persistent store cannot be initialised — e.g. an absent/read-only home
+        dir. In that case there is no journal to resume against, so durable runs
+        must *not* auto-enable. We therefore consult the instantiated store, not
+        just the ``session.persist`` intent, so a silent fallback doesn't leave
+        ``ExecutionConfig(durable=True)`` recording against in-memory sessions.
+        """
+        return self._session_store is not None
+
+    def _durable_runs_from_config(self, cfg: Optional[Dict[str, Any]]) -> bool:
+        """Return whether gateway turns should run crash-safe (journal-backed).
+
+        Issue #4216: a gateway restart mid-turn must resume *crash-safely* by
+        default. Sessions are already durable by default, and the gateway
+        already attempts resume on boot — so the safe, journal-backed path is
+        auto-enabled when a durable session store is present, replacing the old
+        unsafe re-drive that re-executed side-effecting tools and re-billed the
+        model. Two explicit, zero-overhead escape hatches opt back out:
+
+          * ``gateway.durable_runs: false`` — the operator turns it off; or
+          * ``gateway.reliability: "off"`` — the immediate-teardown posture that
+            already opts out of the gateway's safety defaults.
+
+        An explicit ``gateway.durable_runs`` (Issue #4028) always wins over the
+        auto-default. Individual agents may still override via a per-agent
+        ``durable`` key. Absent an explicit choice, the auto-default follows the
+        *effective* session store (see :meth:`_durable_store_present`): if the
+        persistent store degraded to in-memory, there is no journal to resume
+        against and durable runs stay off.
         """
         if not isinstance(cfg, dict):
-            return False
+            return self._durable_store_present({})
         gw_cfg = cfg.get("gateway", {})
         if not isinstance(gw_cfg, dict):
+            gw_cfg = {}
+
+        # An explicit operator choice always wins (both directions).
+        explicit = gw_cfg.get("durable_runs")
+        if explicit is not None:
+            return WebSocketGateway._config_bool(explicit, True)
+
+        # ``reliability: "off"`` is the documented immediate-teardown posture;
+        # keep durable runs off there for the zero-overhead path.
+        reliability = gw_cfg.get("reliability")
+        if isinstance(reliability, str) and reliability.strip().lower() == "off":
             return False
-        return WebSocketGateway._config_bool(gw_cfg.get("durable_runs"), False)
+
+        # Auto-enable when the effective session store is durable (the default).
+        return self._durable_store_present(gw_cfg)
 
     def _create_agents_from_config(
         self,
@@ -6032,13 +6336,17 @@ class WebSocketGateway:
             default_model: Fallback model when an agent has no ``model`` key
                            (e.g. from the ``provider.model`` section of UI config).
             guardrails_cfg: Optional ``guardrails.registry`` dict to wire per-agent.
-            durable_runs: When ``True`` (operator opt-in via ``gateway.durable_runs``),
+            durable_runs: When ``True`` (crash-safe by default when a durable
+                          session store is present — see
+                          :meth:`_durable_runs_from_config`, Issue #4216),
                           construct each agent with ``ExecutionConfig(durable=True)`` so
                           every gateway turn is journalled to the core ``RunJournal`` and
                           can resume after a restart — no re-execution of side-effecting
-                          tools, no re-billing of LLM calls. Default-off/zero-overhead:
-                          when unset the execution hot path is unchanged. Per-agent
-                          ``durable`` in YAML overrides this gateway-wide default.
+                          tools, no re-billing of LLM calls. When ``False`` (explicit
+                          ``durable_runs: false`` / ``reliability: "off"`` / no durable
+                          store) the execution hot path is unchanged (zero-overhead).
+                          Per-agent ``durable`` in YAML overrides this gateway-wide
+                          default.
         """
         from praisonaiagents import Agent
 
@@ -7152,7 +7460,11 @@ class WebSocketGateway:
             if env_val:
                 init_kwargs[param] = env_val
         for key, value in ch_cfg.items():
-            if key in ("platform", "token"):
+            # ``platform``/``token`` are wired explicitly above; ``adapter`` is a
+            # loader-only YAML import ref (Issue #4104) that self-registers the
+            # class — it must never reach the adapter constructor, whose
+            # signature does not accept it.
+            if key in ("platform", "token", "adapter"):
                 continue
             init_kwargs[key] = value
 
