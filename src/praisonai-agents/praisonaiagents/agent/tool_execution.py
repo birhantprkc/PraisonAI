@@ -2996,18 +2996,31 @@ class ToolExecutionMixin:
         else:
             return f"Unknown bridge tool: {function_name}"
 
-    def _tool_declares_not_idempotent(self, tool_name):
+    def _tool_declares_not_idempotent(self, tool_name, tools_override=None):
         """True only when the tool *explicitly* declares itself unsafe to re-run.
 
-        Distinct from ``_is_tool_idempotent``, which answers False for unknown
-        tools as a safe default. Gating a retry on that would stop retrying every
-        unregistered user tool; gating it on an *explicit* declaration vetoes only
-        what the author actually marked, so existing retry behaviour is unchanged
-        for everything else.
+        Deliberately narrower than ``_is_tool_idempotent``, which answers False
+        for unknown tools as a safe default: gating a retry on that would stop
+        retrying every unregistered user tool.
+
+        This keys on an explicit declaration and nothing else. In particular it
+        must NOT consult the shared ``MUTATING_TOOLS`` name registry -- that is a
+        73-name list maintained for the escalation loop guard, and using it here
+        silently removed the retry from any *undeclared* tool that happened to
+        share a name with an entry (``write_file``, ``store_memory``, ``mkdir``...).
+
+        ``tools_override`` mirrors the resolution order in ``_execute_tool_impl`` /
+        ``_execute_tool_async_impl``: a task-scoped tool passed via ``tools_override``
+        shadows an agent-level tool of the same name, so its declaration must win.
+        Without this an override-only ``restart_safe=False`` tool would be missed
+        here and silently retried.
         """
         tools = getattr(self, 'tools', [])
         if not isinstance(tools, (list, tuple)):
             tools = []
+        if isinstance(tools_override, (list, tuple)):
+            # Override tools take precedence and are searched first.
+            tools = list(tools_override) + list(tools)
         for tool in tools:
             name_attr = getattr(tool, '__name__', None) or getattr(tool, 'name', None)
             if name_attr == tool_name:
@@ -3019,12 +3032,21 @@ class ToolExecutionMixin:
                     explicit = getattr(tool, 'restart_safe', None)
                 if isinstance(explicit, bool):
                     return not explicit
-                break
-        try:
-            from ..escalation.loop_guard import MUTATING_TOOLS
-        except Exception:
-            return False
-        return tool_name in MUTATING_TOOLS
+                return False
+        # A tool from the process-global registry (only reachable under
+        # ToolConfig(allow_global_tools=True)) can carry its own declaration;
+        # ``_is_tool_idempotent`` consults it, so this must too.
+        if getattr(self, '_allow_global_tools', False):
+            try:
+                from ..tools.registry import get_registry
+                global_tool = get_registry().get(tool_name)
+                for attr in ('idempotent', 'restart_safe'):
+                    explicit = getattr(global_tool, attr, None)
+                    if isinstance(explicit, bool):
+                        return not explicit
+            except Exception:
+                pass
+        return False
 
     def _is_tool_idempotent(self, tool_name):
         """Whether re-running ``tool_name`` is safe (no duplicated side effects).
