@@ -7,11 +7,16 @@ never cross the Tauri IPC bridge, which is the one design point all four
 reference apps converge on.
 """
 
+import atexit
 import collections
+import hashlib
 import json
+import logging
 import os
 import pathlib
 import secrets
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -29,17 +34,241 @@ if (_SOURCE / "praisonaiagents" / "__init__.py").is_file():
     sys.path.insert(0, str(_SOURCE))
 
 
+MIN_API_KEY_CHARS = 20
+
+# What this process exported, so clearing a setting removes our value and never
+# a value the user's shell provided.
+_EXPORTED: dict = {}
+
+
+def _export(name: str, value: str) -> None:
+    _EXPORTED[name] = value
+    os.environ[name] = value
+
+
+def _unset_if_ours(name: str) -> None:
+    ours = _EXPORTED.pop(name, None)
+    if ours is not None and os.environ.get(name) == ours:
+        del os.environ[name]
 PORT_MARKER = "PRAISONAI_PORT="
 PROTOCOL_VERSION = 2
 
 # Transcripts live outside the app bundle, in the user's own space, so an app
 # update can never take them with it. Append-only JSON per conversation: the
 # format a user can read, diff and back up without our help.
-DATA_DIR = pathlib.Path(
-    os.environ.get("PRAISONAI_DESKTOP_HOME")
-    or (pathlib.Path.home() / "Library/Application Support/PraisonAI")
-)
+APP_NAME = "PraisonAI"
+
+
+def default_data_dir(platform=None, home=None, env=None):
+    """Where the app keeps transcripts, settings and the lockfile.
+
+    Taken per platform rather than hardcoded to the macOS location. On Windows
+    a "Library/Application Support" folder is not merely unconventional -- it
+    is excluded from roaming profiles and from most backup tooling, so a user's
+    entire history would silently fail to follow them to a new machine.
+
+    The Rust shell derives the same path in engine_paths.rs; the two must agree
+    or the shell will look for an engine where the engine is not.
+    """
+    platform = sys.platform if platform is None else platform
+    env = os.environ if env is None else env
+    home = pathlib.Path.home() if home is None else home
+    override = env.get("PRAISONAI_DESKTOP_HOME")
+    if override:
+        return pathlib.Path(override)
+    if platform == "darwin":
+        return home / "Library/Application Support" / APP_NAME
+    if platform.startswith("win"):
+        roaming = env.get("APPDATA")
+        return (pathlib.Path(roaming) if roaming else home / "AppData/Roaming") / APP_NAME
+    # Linux and the BSDs: the XDG base directory spec.
+    xdg = env.get("XDG_DATA_HOME")
+    return (pathlib.Path(xdg) if xdg else home / ".local/share") / APP_NAME
+
+
+DATA_DIR = pathlib.Path(default_data_dir())
 CHATS_DIR = DATA_DIR / "chats"
+
+# The shell's src-tauri/src/lockfile.rs has always specified this file's format
+# precisely and nothing ever wrote one, so the whole adoption path -- and any
+# tool trying to find a running engine -- had nothing to read. `pgrep -f` is not
+# a substitute: the shell running the pgrep matches the pattern itself.
+LOCK_PATH = DATA_DIR / "engine.lock"
+
+# Built on first use: importing the training module costs nothing until someone
+# opens the tab, and the engine must stay fast to start for chat.
+_TRAINER = None
+LOCK_FORMAT_VERSION = 2
+
+
+def _fnv1a64(text: str) -> int:
+    """FNV-1a. Small, exact, and identical to the Rust side by construction."""
+    h = 0xCBF29CE484222325
+    for b in text.encode():
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def _start_time(pid: "int | None" = None) -> int:
+    """A fingerprint of when this pid started, so a recycled pid is not us.
+
+    This hashes `ps -o lstart=` verbatim rather than parsing it. The date `ps`
+    prints is locale-dependent -- on this machine it is "Tue 25 Aug 15:26:04
+    2026", day before month, which neither `time.strptime` nor
+    `date -j -f "%a %b %e %T %Y"` accepts. Both sides silently fell back to
+    something else and never agreed, so a live engine always looked like a
+    recycled pid and a second one was started beside it.
+    """
+    pid = pid or os.getpid()
+    if sys.platform.startswith("win"):
+        return _windows_start_time(pid)
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:  # noqa: BLE001
+        return 0
+    return _fnv1a64(out.strip()) if out.strip() else 0
+
+
+def _windows_start_time(pid: int) -> int:
+    """The process creation time, hashed the same way as the ps output.
+
+    Windows has no `ps`, so the POSIX path returns 0 for every process -- and
+    0 is the "I could not tell" value, which means every recycled pid compares
+    equal and an unrelated process gets adopted as the engine. GetProcessTimes
+    gives a real 100-nanosecond creation stamp.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return 0                       # no such process, or not ours to ask
+        try:
+            created = wintypes.FILETIME()
+            spare = wintypes.FILETIME()
+            ok = kernel32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(spare),
+                ctypes.byref(spare), ctypes.byref(spare))
+            if not ok:
+                return 0
+            stamp = (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return _fnv1a64(f"{pid}:{stamp}")
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def register_exit_signals(handler, module=None):
+    """Register `handler` for every termination signal this platform has.
+
+    The names are looked up one at a time rather than gathered into a tuple.
+    Building `(SIGTERM, SIGINT, SIGHUP)` dereferences SIGHUP before any `try`
+    runs, and Windows has no SIGHUP -- so the AttributeError escaped, and it
+    escaped *after* the port had been announced and the lockfile written. The
+    shell would adopt an engine that was already dead, and every request would
+    look like a network fault rather than a crash.
+    """
+    module = signal if module is None else module
+    for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
+        sig = getattr(module, name, None)
+        if sig is None:
+            continue                      # this platform does not have it
+        try:
+            module.signal(sig, handler)
+        except (ValueError, OSError):
+            pass                          # not the main thread, or not allowed
+
+
+def write_lock_text(path: pathlib.Path, body: str) -> pathlib.Path:
+    """Write the lockfile atomically, always as UTF-8.
+
+    The encoding is explicit because the Rust side reads this file as strict
+    UTF-8 and maps invalid bytes to "absent" -- and absent means spawn. A user
+    whose home directory is not ASCII would otherwise get a second engine
+    beside the live one on every launch, which is the exact orphan leak the
+    lockfile exists to prevent.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".lock.tmp")
+    tmp.write_text(body, encoding="utf-8")
+    _replace_with_retry(tmp, path)
+    return path
+
+
+def _replace_with_retry(tmp: pathlib.Path, target: pathlib.Path, attempts: int = 4) -> None:
+    """os.replace, tolerating a Windows reader holding the destination open.
+
+    The call is atomic on all three platforms, but Windows raises
+    PermissionError if any process has the target open -- a real risk for a
+    lockfile the shell polls, and for a settings file an antivirus scanner is
+    reading. Retrying briefly is the standard mitigation; the last attempt is
+    allowed to raise so a genuine failure is not swallowed.
+    """
+    for attempt in range(attempts):
+        try:
+            tmp.replace(target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05)
+
+
+def read_text_file(path) -> str:
+    """Read a text file as UTF-8, replacing anything undecodable.
+
+    Without an explicit encoding this decodes in the locale encoding -- cp1252
+    on a default Windows box -- and because errors are replaced rather than
+    raised, the caller is handed plausible-looking mojibake and never finds
+    out. A model asked to reason over it will do so confidently.
+    """
+    return pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+
+
+def allow_address_reuse(platform=None) -> bool:
+    """Whether the listening socket should set SO_REUSEADDR.
+
+    On POSIX it means "reuse an address still in TIME_WAIT" and is what we
+    want. On Windows the same flag means "another process may bind this exact
+    address while I am still listening" -- and this server is unauthenticated
+    loopback HTTP carrying API keys and transcripts, so a local process that
+    guessed the port could take over connections. Windows sockets are
+    exclusive by default, which is the behaviour we want there.
+    """
+    platform = sys.platform if platform is None else platform
+    return not platform.startswith("win")
+
+
+def write_lock(port: int) -> pathlib.Path:
+    """Write the lockfile in exactly the format lockfile.rs parses.
+
+    Written to a temporary file and renamed, because the parser treats a
+    zero-length file as a crash mid-write -- so we must never produce one.
+    """
+    interpreter = sys.executable or "unknown"
+    venv_root = sys.prefix
+    config_hash = hashlib.sha256(
+        json.dumps(load_settings(), sort_keys=True).encode()).hexdigest()[:16]
+    body = (f"format_version={LOCK_FORMAT_VERSION}\n"
+            f"pid={os.getpid()}\n"
+            f"start_time={_start_time()}\n"
+            f"port={port}\n"
+            f"interpreter={interpreter}\n"
+            f"venv_root={venv_root}\n"
+            f"config_hash={config_hash}\n")
+    return write_lock_text(LOCK_PATH, body)
+
+
+def clear_lock() -> None:
+    try:
+        LOCK_PATH.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _chat_path(cid: str) -> pathlib.Path:
@@ -285,7 +514,7 @@ def _builtin_tools():
             return f"No such file: {f}"
         if f.stat().st_size > 200_000:
             return f"File too large ({f.stat().st_size} bytes); read a smaller file."
-        return f.read_text(errors="replace")
+        return read_text_file(f)
 
     def list_directory(path: str = ".") -> str:
         """List the entries in a directory.
@@ -416,35 +645,243 @@ DEFAULT_SETTINGS = {
 # Secrets go to the macOS keychain, never into settings.json. One reference app
 # keyrings its API keys and then writes its proxy password to the settings file
 # in plaintext -- the split is easy to get half-right, so it is centralised here.
-KEYCHAIN_SERVICE = "ai.praison.desktop"
+# Overridable so a test never writes into the developer's real keychain.
+# PRAISONAI_DESKTOP_HOME isolates the data directory but not the system
+# keyring, which is shared per user -- a test run against the default service
+# silently overwrites whatever key the person is actually using, and there is
+# no way to put it back. Asking for isolation must isolate everything.
+KEYCHAIN_SERVICE = os.environ.get("PRAISONAI_KEYCHAIN_SERVICE", "ai.praison.desktop")
 SECRET_KEYS = {"api_key"}
 
 
+def _quiet_subprocess_kwargs():
+    """Keep a console window from flashing on Windows.
+
+    A Tauri app is a GUI process with no console attached, so every bare Popen
+    of a helper pops a black box on screen. load_settings() reads a secret on
+    every turn, which would make this a flash per message.
+    """
+    if not sys.platform.startswith("win"):
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
+class KeychainSecretStore:
+    """The macOS keychain, via the `security` binary."""
+
+    path = None
+
+    def set(self, name: str, value: str) -> bool:
+        try:
+            if value:
+                subprocess.run(["security", "add-generic-password", "-U",
+                                "-s", KEYCHAIN_SERVICE, "-a", name, "-w", value],
+                               check=True, capture_output=True, timeout=10,
+                               **_quiet_subprocess_kwargs())
+            else:
+                subprocess.run(["security", "delete-generic-password",
+                                "-s", KEYCHAIN_SERVICE, "-a", name],
+                               capture_output=True, timeout=10,
+                               **_quiet_subprocess_kwargs())
+            return True
+        except Exception:  # noqa: BLE001 - a keychain failure must not lose the turn
+            return False
+
+    def get(self, name: str) -> str:
+        try:
+            r = subprocess.run(["security", "find-generic-password",
+                                "-s", KEYCHAIN_SERVICE, "-a", name, "-w"],
+                               capture_output=True, timeout=10, text=True,
+                               **_quiet_subprocess_kwargs())
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+class SecretToolSecretStore:
+    """The freedesktop secret service, via libsecret's `secret-tool`."""
+
+    path = None
+
+    def set(self, name: str, value: str) -> bool:
+        try:
+            if value:
+                subprocess.run(["secret-tool", "store", "--label",
+                                f"{KEYCHAIN_SERVICE} {name}",
+                                "service", KEYCHAIN_SERVICE, "account", name],
+                               input=value.encode(), check=True,
+                               capture_output=True, timeout=10)
+            else:
+                subprocess.run(["secret-tool", "clear",
+                                "service", KEYCHAIN_SERVICE, "account", name],
+                               capture_output=True, timeout=10)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def get(self, name: str) -> str:
+        try:
+            r = subprocess.run(["secret-tool", "lookup",
+                                "service", KEYCHAIN_SERVICE, "account", name],
+                               capture_output=True, timeout=10, text=True)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+class DpapiSecretStore:
+    """Windows DPAPI: encrypted to the logged-in user, no extra dependency."""
+
+    def __init__(self, data_dir):
+        self.path = pathlib.Path(data_dir) / "secrets.dat"
+
+    def _crypt(self, blob, protect):
+        import ctypes
+        from ctypes import wintypes
+
+        class Blob(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        buffer = ctypes.create_string_buffer(blob, len(blob))
+        source = Blob(len(blob), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+        result = Blob()
+        crypt32 = ctypes.windll.crypt32
+        call = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+        args = ([ctypes.byref(source), None, None, None, None, 0, ctypes.byref(result)]
+                if protect else
+                [ctypes.byref(source), None, None, None, None, 0, ctypes.byref(result)])
+        if not call(*args):
+            raise OSError("DPAPI call failed")
+        try:
+            return ctypes.string_at(result.pbData, result.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(result.pbData)
+
+    def _read(self):
+        try:
+            return json.loads(self._crypt(self.path.read_bytes(), False).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def set(self, name: str, value: str) -> bool:
+        try:
+            store = self._read()
+            if value:
+                store[name] = value
+            else:
+                store.pop(name, None)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            blob = self._crypt(json.dumps(store).encode("utf-8"), True)
+            tmp = self.path.with_suffix(".dat.tmp")
+            tmp.write_bytes(blob)
+            _replace_with_retry(tmp, self.path)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def get(self, name: str) -> str:
+        return str(self._read().get(name, ""))
+
+
+class FileSecretStore:
+    """A 0600 file beside the settings, for when nothing better is available.
+
+    Not encryption -- it is file permissions, which is what an unlocked
+    keyring amounts to in practice anyway. The point is that a secret is never
+    written into settings.json, which users paste into issues.
+    """
+
+    def __init__(self, data_dir):
+        self.path = pathlib.Path(data_dir) / "secrets.json"
+
+    def _read(self) -> dict:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def set(self, name: str, value: str) -> bool:
+        try:
+            store = self._read()
+            if value:
+                store[name] = value
+            else:
+                store.pop(name, None)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
+            # Created 0600 *before* anything is written to it, so the secret is
+            # never briefly world-readable between creation and chmod.
+            handle = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as out:
+                json.dump(store, out)
+            _replace_with_retry(tmp, self.path)
+            try:
+                os.chmod(str(self.path), 0o600)
+            except OSError:
+                pass                      # Windows has no POSIX mode bits
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def get(self, name: str) -> str:
+        return str(self._read().get(name, ""))
+
+
+class FallbackSecretStore:
+    """Try the platform store; fall back rather than lose the secret.
+
+    Without this, a machine with no keyring daemon -- a headless Linux box, a
+    fresh container, a locked login keyring -- makes the app permanently
+    unauthenticated with no user-visible cause: the write reports failure and
+    the read reports the key as unset, forever.
+    """
+
+    def __init__(self, primary, secondary):
+        self.primary, self.secondary = primary, secondary
+
+    @property
+    def path(self):
+        return self.secondary.path
+
+    def set(self, name: str, value: str) -> bool:
+        if self.primary.set(name, value):
+            return True
+        return self.secondary.set(name, value)
+
+    def get(self, name: str) -> str:
+        return self.primary.get(name) or self.secondary.get(name)
+
+
+def secret_store_for(platform=None, data_dir=None):
+    """The best available secret store for this platform, with a fallback."""
+    platform = sys.platform if platform is None else platform
+    data_dir = DATA_DIR if data_dir is None else data_dir
+    fallback = FileSecretStore(data_dir)
+    if platform == "darwin":
+        return FallbackSecretStore(KeychainSecretStore(), fallback)
+    if platform.startswith("win"):
+        return FallbackSecretStore(DpapiSecretStore(data_dir), fallback)
+    return FallbackSecretStore(SecretToolSecretStore(), fallback)
+
+
+_SECRETS = None
+
+
+def _secrets():
+    global _SECRETS
+    if _SECRETS is None:
+        _SECRETS = secret_store_for()
+    return _SECRETS
+
+
 def keychain_set(name: str, value: str) -> bool:
-    import subprocess
-    try:
-        if value:
-            subprocess.run(["security", "add-generic-password", "-U",
-                            "-s", KEYCHAIN_SERVICE, "-a", name, "-w", value],
-                           check=True, capture_output=True, timeout=10)
-        else:
-            subprocess.run(["security", "delete-generic-password",
-                            "-s", KEYCHAIN_SERVICE, "-a", name],
-                           capture_output=True, timeout=10)
-        return True
-    except Exception:  # noqa: BLE001 - a keychain failure must not lose the turn
-        return False
+    return _secrets().set(name, value)
 
 
 def keychain_get(name: str) -> str:
-    import subprocess
-    try:
-        r = subprocess.run(["security", "find-generic-password",
-                            "-s", KEYCHAIN_SERVICE, "-a", name, "-w"],
-                           capture_output=True, timeout=10, text=True)
-        return r.stdout.strip() if r.returncode == 0 else ""
-    except Exception:  # noqa: BLE001
-        return ""
+    return _secrets().get(name)
 
 
 def load_settings() -> dict:
@@ -467,7 +904,8 @@ def save_settings(patch: dict) -> dict:
             merged[k] = patch[k]
     for k in SECRET_KEYS:
         if k in patch:
-            keychain_set(k, str(patch[k] or ""))
+            if not keychain_set(k, str(patch[k] or "")):
+                raise RuntimeError(f"could not store {k} in the keychain")
             merged[k] = patch[k]
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = SETTINGS_PATH.with_suffix(".tmp")
@@ -505,41 +943,122 @@ def _llm_overrides(cfg: dict) -> dict:
 
 def _apply_env(cfg: dict) -> None:
     """Credentials and endpoint go to the environment, which the OpenAI client
-    reads directly -- the constructor parameter routes through the heavier path.
-
-    A cleared value must *remove* the variable, not be skipped: leaving a stale
-    key or base_url in os.environ would keep routing subsequent turns to the
-    credential or endpoint the user just deleted.
-    """
+    reads directly -- the constructor parameter routes through the heavier path."""
     if cfg.get("base_url"):
         # Set as an env var rather than base_url=, which routes through a
         # heavier code path for identical intent.
-        os.environ["OPENAI_API_BASE"] = cfg["base_url"]
-    elif "base_url" in cfg:
-        os.environ.pop("OPENAI_API_BASE", None)
-    if cfg.get("api_key"):
-        os.environ["OPENAI_API_KEY"] = cfg["api_key"]
-    elif "api_key" in cfg:
-        os.environ.pop("OPENAI_API_KEY", None)
+        _export("OPENAI_API_BASE", cfg["base_url"])
+    else:
+        # Clearing the setting clears only what *we* exported. Popping
+        # unconditionally deleted the key inherited from the user's shell --
+        # and this setting is documented as "blank uses the environment", so
+        # that turned every request into an auth error.
+        _unset_if_ours("OPENAI_API_BASE")
+    key = cfg.get("api_key") or ""
+    # A too-short value is a typo or a test fixture, not a credential. Exporting
+    # it would replace a working environment key with a guaranteed 401. The UI
+    # refuses it at entry (see api_key's validate) so this is a backstop, not
+    # the only guard -- silently ignoring it is what made a bad key look set.
+    if len(key) >= MIN_API_KEY_CHARS:
+        _export("OPENAI_API_KEY", key)
+    elif not key:
+        _unset_if_ours("OPENAI_API_KEY")
 
 
-def _get_agent(session_id: str = "default"):
+def _installed_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("praisonaiagents")
+    except Exception:
+        return "unknown"
+
+
+def _vtuple(v: str):
+    out = []
+    for part in v.split(".")[:4]:
+        digits = "".join(c for c in part if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+def check_for_update(timeout: float = 4.0) -> dict:
+    """Ask PyPI what the newest praisonaiagents is.
+
+    Reports `checked: False` on any failure rather than "up to date" -- a check
+    that did not happen must not read as a check that passed.
+    """
+    current = _installed_version()
+    if not load_settings().get("check_updates", True):
+        return {"current": current, "checked": False,
+                "update_available": False, "message": "Update checks are off."}
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+            "https://pypi.org/pypi/praisonaiagents/json", timeout=timeout
+        ) as r:
+            latest = json.loads(r.read().decode())["info"]["version"]
+    except Exception as exc:
+        return {"current": current, "checked": False, "update_available": False,
+                "message": f"Could not reach PyPI: {exc.__class__.__name__}"}
+    newer = current != "unknown" and _vtuple(latest) > _vtuple(current)
+    return {"current": current, "latest": latest, "checked": True,
+            "update_available": newer,
+            "message": (f"praisonaiagents {latest} is available."
+                        if newer else "You are on the latest version.")}
+
+
+LAUNCH_AGENT = pathlib.Path(
+    "~/Library/LaunchAgents/ai.praison.desktop.plist").expanduser()
+
+
+def set_launch_at_login(on: bool) -> dict:
+    """Write or remove the LaunchAgent that opens the app at login.
+
+    Uses the running .app bundle, so this is a no-op in dev where there is no
+    bundle to open -- reported as such rather than silently succeeding.
+    """
+    app = os.environ.get("PRAISONAI_APP_BUNDLE") or ""
+    if not on:
+        try:
+            LAUNCH_AGENT.unlink()
+        except FileNotFoundError:
+            pass
+        return {"ok": True, "enabled": False}
+    if not app.endswith(".app") or not os.path.isdir(app):
+        return {"ok": False, "enabled": False,
+                "message": "Only available in the installed app."}
+    LAUNCH_AGENT.parent.mkdir(parents=True, exist_ok=True)
+    LAUNCH_AGENT.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0"><dict>\n'
+        '  <key>Label</key><string>ai.praison.desktop</string>\n'
+        '  <key>ProgramArguments</key>'
+        f'<array><string>/usr/bin/open</string><string>{app}</string></array>\n'
+        '  <key>RunAtLoad</key><true/>\n'
+        '</dict></plist>\n')
+    return {"ok": True, "enabled": True, "path": str(LAUNCH_AGENT)}
+
+
+def _get_agent(session_id: str = "default", tools: bool = True):
     """One agent per session, built lazily: importing the engine costs more than
     binding a socket, and the window should be interactive before that is paid."""
     with _agent_lock:
-        if session_id not in _agents:
+        key = session_id if tools else session_id + "\x00notools"
+        if key not in _agents:
             from praisonaiagents import Agent
 
             cfg = load_settings()
-            _agents[session_id] = Agent(
+            _agents[key] = Agent(
                 name="PraisonAI",
                 role="Assistant",
                 goal="Answer the user clearly and concisely.",
                 instructions=cfg["system_prompt"] or None,
                 llm=cfg["model"],
-                tools=_builtin_tools(),
+                tools=_builtin_tools() if tools else None,
             )
-        return _agents[session_id]
+        return _agents[key]
 
 
 # --- stream protocol v2 -------------------------------------------------------
@@ -592,20 +1111,84 @@ def _classify_stream_item(item):
     return "delta", {"text": str(item)}
 
 
-def _persist(chat_id: str, prompt: str, reply: list) -> None:
-    """Append one exchange. Called only after a run completes, never per token --
-    a per-token write is how a chat app burns through an SSD's write endurance."""
+def version_info(chat_id: str, user_index: "int | None") -> tuple:
+    """(count, active) for the answer to `user_index`. (1, 0) when unversioned."""
+    if user_index is None:
+        return (1, 0)
+    try:
+        msgs = load_chat(chat_id)["messages"]
+        msg = msgs[user_index + 1]
+        versions = msg.get("versions")
+        if not versions:
+            return (1, 0)
+        return (len(versions), min(max(int(msg.get("active", 0)), 0), len(versions) - 1))
+    except Exception:  # noqa: BLE001
+        return (1, 0)
+
+
+def _active(msg: dict) -> str:
+    """The text of an assistant message's currently selected version.
+
+    A message written before versioning has no `versions` key and is its own
+    only version, so this reads correctly for every chat already on disk.
+    """
+    versions = msg.get("versions")
+    if not versions:
+        return msg.get("content", "")
+    i = min(max(int(msg.get("active", 0)), 0), len(versions) - 1)
+    return versions[i]
+
+
+def _persist(chat_id: str, prompt: str, reply: list,
+             regenerate_of: "int | None" = None) -> "int | None":
+    """Append one exchange and return the index the user message landed at.
+
+    The index has to come from here because the client cannot compute it: a
+    cancelled or errored turn is never persisted, yet it stays on screen. The UI
+    used to derive `idx*2` from DOM position, so one unpersisted turn shifted
+    every subsequent Fork and Delete onto the wrong message -- and the resulting
+    404 was ignored, so the turn vanished from the screen and stayed on disk.
+
+    Returns None if the write failed, which is the caller's signal that Fork and
+    Delete must not be offered for this turn at all.
+    """
     try:
         chat = load_chat(chat_id)
         chat["id"] = chat_id
+        text = "".join(reply)
+
+        # Regenerating keeps the previous answer as a prior version rather than
+        # discarding it. Without this the only way to compare two answers is to
+        # copy one out before asking for the other.
+        if regenerate_of is not None:
+            msgs = chat["messages"]
+            a = regenerate_of + 1
+            if 0 <= regenerate_of < len(msgs) and a < len(msgs) \
+                    and msgs[a].get("role") == "assistant":
+                target = msgs[a]
+                versions = target.get("versions") or [target.get("content", "")]
+                versions.append(text)
+                target["versions"] = versions
+                target["active"] = len(versions) - 1
+                target["content"] = text        # readers that predate versions
+                chat["updated"] = int(time.time())
+                save_chat(chat)
+                return regenerate_of
+            # The turn it named is gone: fall through and append a new exchange
+            # rather than silently writing nothing.
+
+        user_index = len(chat["messages"])
         chat["messages"].append({"role": "user", "content": prompt})
-        chat["messages"].append({"role": "assistant", "content": "".join(reply)})
-        if chat.get("title") in (None, "", "New chat"):
+        chat["messages"].append({"role": "assistant", "content": text})
+        if load_settings().get("auto_title", True) and chat.get("title") in (
+            None, "", "New chat"
+        ):
             chat["title"] = (prompt[:48] + "…") if len(prompt) > 48 else prompt
         chat["updated"] = int(time.time())
         save_chat(chat)
+        return user_index
     except Exception:  # noqa: BLE001 - persistence must never break a reply
-        pass
+        return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -624,6 +1207,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _drain(self) -> bytes:
+        """Read the request body exactly once, and return it.
+
+        HTTP/1.1 keep-alive reuses the connection, so a body left unread is
+        parsed as the start of the next request -- the following GET came back
+        as 501 Unsupported method ('{}GET'). Every handler must therefore
+        drain, including the ones that ignore the body.
+
+        It returns the bytes because the first version did not: handlers that
+        *did* want the body called `_drain()` and then `rfile.read(length)`,
+        and the second read blocked forever on an empty socket. /approve and
+        /project hung for the full approval timeout. A read that can only
+        happen in one place cannot be done twice.
+        """
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        return self.rfile.read(n) if n > 0 else b""
+
+    def _body(self) -> dict:
+        """The request body as a dict; `{}` for absent or malformed JSON."""
+        raw = self._drain()
+        try:
+            value = json.loads(raw or b"{}")
+        except (ValueError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
     def _json(self, payload, status=200):
         body = json.dumps(payload).encode()
         self.send_response(status)
@@ -633,9 +1245,85 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # --- training -------------------------------------------------------
+    def _training(self):
+        """The one Trainer, built on first use so importing costs nothing."""
+        global _TRAINER
+        if _TRAINER is None:
+            from training import Trainer
+            _TRAINER = Trainer(DATA_DIR, sys.executable)
+        return _TRAINER
+
+    def _train_progress(self, run, cursor):
+        """Replay from `cursor`, then follow. Not a subscription: a client that
+        reconnects after a closed lid gets what it missed, which is the whole
+        reason events are kept rather than streamed and dropped."""
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        idle = 0
+        while True:
+            events, gap = run.since(cursor)
+            if gap:
+                # Say so rather than handing over events with a hole in them.
+                self.wfile.write(b"event: resync\ndata: {}\n\n")
+                self.wfile.flush()
+                cursor = -1
+                continue
+            for c, kind, payload in events:
+                cursor = c
+                body = json.dumps({"cursor": c, **payload})
+                self.wfile.write(
+                    f"id: {c}\nevent: {kind}\ndata: {body}\n\n".encode())
+            if events:
+                self.wfile.flush()
+                idle = 0
+            else:
+                idle += 1
+                if idle % 20 == 0:
+                    # A heartbeat, so a proxy does not reap an idle stream and
+                    # the client can tell "quiet" from "gone".
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+            if run.state in ("done", "failed", "cancelled") and not events:
+                return
+            time.sleep(0.25)
+
     def do_GET(self):
+        if self.path.startswith("/train/progress"):
+            trainer = self._training()
+            from urllib.parse import parse_qs, urlparse
+            query = parse_qs(urlparse(self.path).query)
+            run_id = (query.get("run") or [None])[0]
+            run = trainer.get(run_id) if run_id else trainer.current
+            if run is None:
+                self._json({"ok": False, "error": "no such run"}, 404)
+                return
+            cursor = int((query.get("cursor") or ["-1"])[0])
+            try:
+                self._train_progress(run, cursor)
+            except (BrokenPipeError, ConnectionResetError):
+                pass          # the window closed; the run keeps going
+            return
+
+        if self.path == "/train/runs":
+            self._json({"runs": [r.summary() for r in self._training().history[:50]]})
+            return
+
+        if self.path.startswith("/train/status"):
+            trainer = self._training()
+            run = trainer.current
+            self._json({"run": run.summary() if run else None,
+                        "metrics": run.metrics[-500:] if run else []})
+            return
+
         if self.path == "/settings":
-            self._json(load_settings())
+            cfg = load_settings()
+            # The UI only needs to know whether a key is set, never its value.
+            cfg["api_key"] = "\u2022" * 8 if cfg.get("api_key") else ""
+            self._json(cfg)
             return
         if self.path == "/projects":
             names = sorted({(load_chat(c["id"]).get("project") or "")
@@ -646,10 +1334,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"servers": load_mcp()})
             return
         if self.path == "/update":
-            # Honest: no release feed is wired yet, so say that rather than
-            # reporting "up to date" for a check that never happened.
-            self._json({"current": APP_VERSION, "checked": False,
-                        "message": "Update checks are not configured yet."})
+            self._json(check_for_update())
             return
         if self.path == "/logs":
             # The engine's own recent activity, so a user can see what happened
@@ -674,7 +1359,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"chats": list_chats()})
             return
         if self.path.startswith("/chats/"):
-            self._json(load_chat(self.path.rsplit("/", 1)[-1]))
+            # 404 rather than an empty chat: /fork and /messages already refuse
+            # an unknown id, and fabricating one here meant opening a deleted
+            # conversation showed a blank transcript instead of saying so.
+            cid = self.path.rsplit("/", 1)[-1]
+            if not _chat_path(cid).is_file():
+                self._json({"ok": False, "error": "no such conversation"}, 404)
+                return
+            chat = load_chat(cid)
+            for m in chat.get("messages", []):
+                if m.get("role") == "assistant" and m.get("versions"):
+                    m["content"] = _active(m)
+                    m["version_count"] = len(m["versions"])
+                    m["version_active"] = min(
+                        max(int(m.get("active", 0)), 0), len(m["versions"]) - 1)
+                    m.pop("versions", None)   # the client only needs the one
+            self._json(chat)
             return
         if self.path != "/health":
             self.send_error(404)
@@ -700,7 +1400,42 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def do_POST(self):
+        if self.path == "/train/start":
+            payload = self._body()
+            config = payload.get("config") or {}
+            if not config.get("model_name") or not config.get("dataset"):
+                self._json({"ok": False, "error":
+                            "config needs at least model_name and dataset"}, 400)
+                return
+            try:
+                run = self._training().start(config, payload.get("run_id"))
+            except ValueError as exc:
+                # A rejected run id is the caller's fault, not the server's.
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            except RuntimeError as exc:
+                # A live run is a conflict, not a server error: the client
+                # should show the running job, not a traceback.
+                self._json({"ok": False, "error": str(exc)}, 409)
+                return
+            self._json({"ok": True, "run": run.summary()})
+            return
+
+        if self.path.startswith("/train/stop"):
+            self._drain()
+            run_id = self.path.rsplit("/", 1)[-1] if "/train/stop/" in self.path else None
+            try:
+                stopped = self._training().stop(run_id)
+            except RuntimeError as exc:
+                self._json({"ok": False, "error": str(exc)}, 409)
+                return
+            self._json({"ok": stopped,
+                        "error": None if stopped else "nothing was running"},
+                       200 if stopped else 404)
+            return
+
         if self.path.startswith("/cancel/"):
+            self._drain()
             run_id = self.path.rsplit("/", 1)[-1]
             known = cancel_run(run_id)
             body = json.dumps({"ok": known, "run_id": run_id,
@@ -715,11 +1450,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/approve/"):
             aid = self.path.rsplit("/", 1)[-1]
-            length = int(self.headers.get("Content-Length") or 0)
-            try:
-                choice = json.loads(self.rfile.read(length) or b"{}").get("choice", "deny")
-            except (ValueError, TypeError):
-                choice = "deny"   # a malformed body must never mean "allow"
+            # A malformed or absent body must never mean "allow".
+            choice = self._body().get("choice", "deny")
             ok = resolve_approval(aid, choice)
             self._json({"ok": ok, "error": None if ok else "no such pending approval"},
                        200 if ok else 404)
@@ -732,7 +1464,12 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 self.send_error(400)
                 return
-            self._json(save_settings(patch))
+            saved = save_settings(patch)
+            if "launch_at_login" in patch:
+                saved = dict(saved)
+                saved["launch_at_login_result"] = set_launch_at_login(
+                    bool(patch["launch_at_login"]))
+            self._json(saved)
             return
 
         if self.path == "/mcp":
@@ -767,12 +1504,43 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "servers": servers})
             return
 
+        if self.path.startswith("/version/"):
+            # Select which stored answer is the live one.
+            self._drain()
+            _, _, rest = self.path.partition("/version/")
+            cid, _, rest2 = rest.partition("/")
+            idx, _, want = rest2.partition("/")
+            try:
+                chat = load_chat(cid)
+                if not _chat_path(cid).is_file():
+                    raise KeyError
+                msg = chat["messages"][int(idx) + 1]
+                versions = msg.get("versions") or []
+                n = int(want)
+                if msg.get("role") != "assistant" or not versions \
+                        or not 0 <= n < len(versions):
+                    raise KeyError
+                msg["active"] = n
+                msg["content"] = versions[n]
+                chat["id"] = cid
+                chat["updated"] = int(time.time())
+                save_chat(chat)
+                self._json({"ok": True, "active": n, "count": len(versions),
+                            "content": versions[n]})
+            except (ValueError, KeyError, IndexError):
+                self._json({"ok": False, "error": "no such version"}, 404)
+            return
+
         if self.path.startswith("/fork/"):
+            self._drain()
             # Copy a transcript up to and including message N into a new chat,
             # leaving the original untouched -- a fork, not a rewrite.
             _, _, rest = self.path.partition("/fork/")
             cid, _, idx = rest.partition("/")
             try:
+                if not _chat_path(cid).is_file():
+                    self._json({"ok": False, "error": "no such conversation"}, 404)
+                    return
                 src = load_chat(cid)
                 n = int(idx) + 1
                 new_id = f"{cid}-f{secrets.token_urlsafe(4)}"
@@ -788,11 +1556,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/project/"):
             cid = self.path.rsplit("/", 1)[-1]
-            length = int(self.headers.get("Content-Length") or 0)
-            try:
-                name = json.loads(self.rfile.read(length) or b"{}").get("project", "")
-            except (ValueError, TypeError):
-                name = ""
+            name = self._body().get("project", "")
             chat = load_chat(cid)
             chat["id"] = cid
             chat["project"] = str(name)[:80]
@@ -801,12 +1565,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path.startswith("/messages/"):
+            self._drain()
             # Drop one exchange (a user turn and the reply it produced).
             _, _, rest = self.path.partition("/messages/")
             cid, _, idx = rest.partition("/")
             try:
+                if not _chat_path(cid).is_file():
+                    self._json({"ok": False, "error": "no such conversation"}, 404)
+                    return
                 chat = load_chat(cid)
                 i = int(idx)
+                if i < 0 or i >= len(chat["messages"]):
+                    # A slice delete silently succeeds out of range, so the
+                    # bound is checked rather than inferred from an exception.
+                    self._json({"ok": False, "error": "no such message"}, 404)
+                    return
                 del chat["messages"][i:i + 2]
                 save_chat(chat)
                 self._json({"ok": True, "remaining": len(chat["messages"])})
@@ -841,6 +1614,8 @@ class Handler(BaseHTTPRequestHandler):
             run_id = str(payload.get("run_id") or "")
             session = payload.get("session", "default")
             chat_id = payload.get("chat_id") or session
+            regenerate_of = payload.get("regenerate_of")
+            tools_on = payload.get("tools", True) is not False
             for att in (payload.get("attachments") or [])[:5]:
                 nm = str(att.get("name", "file"))[:120]
                 body = str(att.get("text", ""))[:100_000]
@@ -866,17 +1641,31 @@ class Handler(BaseHTTPRequestHandler):
         if run_id:
             with _cancel_lock:
                 _active_runs.add(run_id)
+        cfg_now = load_settings()
         started = time.perf_counter()
         first_token_at = None
         chars = 0
         reply = []
         tool_started = {}
+        # praisonaiagents logs provider failures and falls back rather than
+        # raising, so a 401 reaches us as an empty stream. Capture the log line
+        # so the user is told "invalid API key" instead of "no output".
+        captured = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.ERROR:
+                    captured.append(record.getMessage())
+
+        _cap = _Capture()
+        logging.getLogger().addHandler(_cap)
         try:
             log(f"turn start chat={chat_id} run={run_id or '-'}")
             _set_emitter(emit)
             _ensure_callbacks()
             _tool_queue().clear()
-            agent = _get_agent(session)
+            _apply_env(load_settings())
+            agent = _get_agent(session, tools=tools_on)
             emit("start", {"run_id": run_id})
             streamed = False
             def _emit_drafting(name):
@@ -903,9 +1692,9 @@ class Handler(BaseHTTPRequestHandler):
                     # explicitly rather than inferring it from a stream that ends.
                     emit("cancelled", {"run_id": run_id})
                     break
-                event, payload = _classify_stream_item(chunk)
+                event, frame = _classify_stream_item(chunk)
                 if event == "delta":
-                    text = payload["text"]
+                    text = frame["text"]
                     if not text:
                         continue
                     if first_token_at is None:
@@ -913,31 +1702,52 @@ class Handler(BaseHTTPRequestHandler):
                     streamed = True
                     chars += len(text)
                     reply.append(text)
-                    emit("delta", payload)
+                    emit("delta", frame)
+                elif event == "reasoning":
+                    if cfg_now.get("show_reasoning", True):
+                        emit("reasoning", frame)
                 elif event == "tool_call":
-                    tool_started[payload["call_id"]] = time.perf_counter()
-                    emit("tool_call", payload)
+                    tool_started[frame["call_id"]] = time.perf_counter()
+                    emit("tool_call", frame)
                 elif event == "tool_result":
-                    began = tool_started.pop(payload["call_id"], None)
+                    began = tool_started.pop(frame["call_id"], None)
                     if began is not None:
-                        payload["seconds"] = round(time.perf_counter() - began, 2)
-                    emit("tool_result", payload)
+                        frame["seconds"] = round(time.perf_counter() - began, 2)
+                    emit("tool_result", frame)
                 else:
-                    emit(event, payload)
+                    emit(event, frame)
             else:
                 if not streamed:
-                    # A stream that yielded nothing is a failure, not an empty answer.
-                    emit("error", {"message": "the engine produced no output", "kind": "empty"})
+                    # A stream that yielded nothing is a failure, not an empty
+                    # answer -- and the cause is usually in the logs, not here.
+                    detail = next((c for c in captured
+                                   if "401" in c or "api key" in c.lower()), None)
+                    if detail:
+                        emit("error", {"kind": "auth", "message":
+                             "The provider rejected the API key. Check it in "
+                             "Settings \u2192 Models. " + detail[:200]})
+                    elif captured:
+                        emit("error", {"kind": "internal",
+                                       "message": captured[-1][:300]})
+                    else:
+                        emit("error", {"message": "the engine produced no output",
+                                       "kind": "empty"})
                 else:
                     _drain_tools()
                     elapsed = time.perf_counter() - started
-                    _persist(chat_id, prompt, reply)
-                    emit("usage", {
-                        "chars": chars,
-                        "seconds": round(elapsed, 2),
-                        "ttft": round(first_token_at - started, 2) if first_token_at else None,
-                    })
-                    emit("end")
+                    user_index = _persist(chat_id, prompt, reply, regenerate_of)
+                    if cfg_now.get("show_stats", True):
+                        emit("usage", {
+                            "chars": chars,
+                            "seconds": round(elapsed, 2),
+                            "ttft": (round(first_token_at - started, 2)
+                                     if first_token_at else None),
+                        })
+                    vinfo = version_info(chat_id, user_index)
+                    emit("end", {"user_index": user_index,
+                                 "assistant_index": None if user_index is None
+                                 else user_index + 1,
+                                 "versions": vinfo[0], "active": vinfo[1]})
         except Exception as exc:  # noqa: BLE001 - the client must see the cause
             # `kind` lets the UI offer the right recovery: a missing key needs
             # settings, a rate limit needs retry, a bug needs the log.
@@ -948,6 +1758,10 @@ class Handler(BaseHTTPRequestHandler):
             log(f"ERROR {name}: {exc}")
             emit("error", {"message": f"{name}: {exc}", "kind": kind})
         finally:
+            try:
+                logging.getLogger().removeHandler(_cap)
+            except Exception:  # noqa: BLE001
+                pass
             _set_emitter(None)
             _tool_queue().clear()
             if run_id:
@@ -958,14 +1772,22 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     # Port 0: the kernel assigns a free one, so a collision is impossible.
+    # Set before construction: the socket is bound inside __init__, so a later
+    # assignment would come too late to affect it.
+    ThreadingHTTPServer.allow_reuse_address = allow_address_reuse()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     print(f"{PORT_MARKER}{port}", flush=True)
     print(f"praisonai runtime listening on 127.0.0.1:{port}", flush=True)
+    write_lock(port)
+    atexit.register(clear_lock)
+    register_exit_signals(lambda *_: sys.exit(0))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        clear_lock()
 
 
 if __name__ == "__main__":

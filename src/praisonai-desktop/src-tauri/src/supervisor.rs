@@ -14,8 +14,41 @@ use crate::readiness::{classify_crash, is_ready_line};
 
 pub struct Engine {
     pub port: u16,
-    #[allow(dead_code)]
     child: Child,
+}
+
+impl Engine {
+    /// Stop the child and wait for it. Idempotent: a child that has already
+    /// exited returns `Ok`, because "already gone" is the outcome we wanted.
+    pub fn shutdown(&mut self) {
+        // Ask first, briefly. A hard kill alone skipped the engine's own
+        // cleanup, so every quit left a lockfile claiming a live engine.
+        //
+        // On Windows "ask" is taskkill /T, which is not graceful -- there is no
+        // SIGTERM, and a console-less process has no window to send WM_CLOSE
+        // to. The stale lockfile that leaves behind is harmless: `observe`
+        // compares the recorded process start time, so a dead pid reads as
+        // gone rather than as a live engine. /T matters more, because it takes
+        // any training run the engine spawned with it.
+        crate::reclaim::kill_pid(self.child.id());
+        for _ in 0..40 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Without this, dropping the handle detaches the process instead of
+        // reaping it -- the app quits and Python keeps holding its port.
+        self.shutdown();
+    }
 }
 
 #[derive(Debug)]
@@ -112,7 +145,7 @@ pub fn start(python: &str, script: &str, timeout: Duration) -> Result<Engine, St
 }
 
 /// Confirm the engine answers on `port` with the shape we expect.
-fn probe_health(port: u16) -> bool {
+pub fn probe_health(port: u16) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
