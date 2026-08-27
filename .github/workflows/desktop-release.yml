@@ -38,12 +38,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14        # Apple silicon
+          # macos-15, not macos-14: that image entered deprecation on
+          # 2026-07-06 and is fully unsupported from 2026-11-02, with brownout
+          # periods failing jobs before then. This is the only Apple-silicon
+          # leg, so losing it means no arm64 DMG at all.
+          - runner: macos-15        # Apple silicon
             target: aarch64-apple-darwin
             bundles: dmg
             ext: dmg
             asset: macos-apple-silicon
-          - runner: macos-13        # Intel
+          # macos-15-intel, not macos-13: that image was retired on
+          # 2025-12-04, so the leg would never schedule and the verify job
+          # below would correctly report a missing asset on every release,
+          # forever. macos-15-intel is GitHub's named x86_64 replacement.
+          - runner: macos-15-intel  # Intel
             target: x86_64-apple-darwin
             bundles: dmg
             ext: dmg
@@ -106,11 +114,59 @@ jobs:
           save-if: ${{ runner.os != 'Windows' }}
 
       - name: Install the Tauri CLI
-        run: cargo install tauri-cli --version '^2' --locked || true
+        shell: bash
+        # `|| true` swallowed a genuine install failure and the next step then
+        # died with an unrelated "no such command: tauri". It also behaved
+        # differently per leg, since Windows defaults to pwsh where `true` is
+        # not a command. Skip the install if it is already there; otherwise
+        # let a failure be a failure.
+        run: command -v cargo-tauri >/dev/null || cargo install tauri-cli --version '^2' --locked
 
       - name: Build the bundle
         working-directory: src/praisonai-desktop/src-tauri
         run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: The macOS bundle must carry a valid signature
+        if: runner.os == 'macOS'
+        working-directory: src/praisonai-desktop/src-tauri
+        run: |
+          set -euo pipefail
+          dmg="$(find "target/${{ matrix.target }}/release/bundle" -name '*.dmg' -print -quit)"
+          [ -n "$dmg" ] || { echo "no .dmg was produced"; exit 1; }
+
+          # Verify inside the DMG, not the .app beside it.
+          #
+          # Tauri deletes the app bundle once the DMG is built -- the build log
+          # says so plainly ("Cleaning .../bundle/macos/PraisonAI.app") -- so a
+          # gate that looked for the .app found nothing and failed every macOS
+          # leg. Reading the DMG is also the better check: it is the artifact
+          # people download, and the one that was broken.
+          #
+          # v4.7.2 shipped a DMG that macOS called "damaged and can't be
+          # opened" on every Mac. The cause was not the missing Developer ID:
+          # the only signature was the one rustc's linker puts on the bare
+          # executable, whose CodeDirectory declares a resource seal that an
+          # unsigned bundle does not have --
+          #
+          #   Sealed Resources=none
+          #   code has no resources but signature indicates they must be present
+          #
+          # That is an *invalid* signature, not an unsigned one, and macOS
+          # reports invalid as "damaged". Right-click -> Open cannot bypass it,
+          # so the instructions shipped alongside it could not work either.
+          mnt="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -quiet -mountpoint "$mnt" "$dmg"
+          trap 'hdiutil detach "$mnt" -quiet || true' EXIT
+
+          app="$(find "$mnt" -maxdepth 1 -name '*.app' -print -quit)"
+          [ -n "$app" ] || { echo "the DMG contains no .app"; ls -la "$mnt"; exit 1; }
+
+          echo "verifying $app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          # Printed, not asserted: --verify already fails on the exact bundle
+          # that shipped, so a second check for the same thing would only be a
+          # second way to say it. This is here to make the log readable.
+          codesign -dv --verbose=2 "$app" 2>&1 | grep -E 'Sealed Resources|flags=' || true
 
       - name: Name the artifact for the platform it runs on
         id: artifact

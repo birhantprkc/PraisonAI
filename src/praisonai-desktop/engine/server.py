@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 # The shell matches this exact prefix. Printed once, after the socket is bound,
 # so a port announced here is always a port that is actually listening.
@@ -29,8 +30,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # the one being edited -- the same source/installed-copy divergence that makes
 # a fix appear to have no effect. Explicit and visible here rather than via
 # PYTHONPATH, which would follow every child process invisibly.
-_SOURCE = pathlib.Path(__file__).resolve().parents[2] / "praisonai-agents"
-if (_SOURCE / "praisonaiagents" / "__init__.py").is_file():
+# Searched upward rather than counted: this file is copied into the bundle at
+# src-tauri/target/<profile>/engine/, where a fixed parents[2] resolves to
+# target/praisonai-agents -- which does not exist. So the branch quietly never
+# taken was the one whose whole purpose is to stop a fix having no effect.
+def _checkout_source():
+    """The praisonai-agents checkout above this file, if there is one."""
+    override = os.environ.get("PRAISONAI_AGENTS_SOURCE", "").strip()
+    if override:
+        candidate = pathlib.Path(override)
+        return candidate if (candidate / "praisonaiagents" / "__init__.py").is_file() else None
+    here = pathlib.Path(__file__).resolve()
+    for parent in here.parents:
+        for candidate in (parent / "praisonai-agents",
+                          parent / "src" / "praisonai-agents"):
+            if (candidate / "praisonaiagents" / "__init__.py").is_file():
+                return candidate
+    return None
+
+
+_SOURCE = _checkout_source()
+if _SOURCE is not None:
     sys.path.insert(0, str(_SOURCE))
 
 
@@ -144,6 +164,9 @@ def _windows_start_time(pid: int) -> int:
 
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         kernel32 = ctypes.windll.kernel32
+        # HANDLE is pointer-sized; the default c_int return truncates it above
+        # 2**31. Unreachable in practice, but wrong for free.
+        kernel32.OpenProcess.restype = ctypes.c_void_p
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return 0                       # no such process, or not ours to ask
@@ -195,7 +218,12 @@ def write_lock_text(path: pathlib.Path, body: str) -> pathlib.Path:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".lock.tmp")
-    tmp.write_text(body, encoding="utf-8")
+    # write_bytes, not write_text: text mode translates "\n" to "\r\n" on
+    # Windows, so the file was not the bytes this function says it writes. The
+    # Rust parser trims each line and would have coped, but a lockfile that
+    # differs by platform is a difference waiting to matter, and the encode is
+    # the only conversion that should be happening here.
+    tmp.write_bytes(body.encode("utf-8"))
     _replace_with_retry(tmp, path)
     return path
 
@@ -298,7 +326,7 @@ def save_chat(chat: dict) -> None:
     # support ticket.
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(chat, indent=1))
-    tmp.replace(path)
+    _replace_with_retry(tmp, path)
 
 
 def list_chats() -> list:
@@ -611,7 +639,7 @@ def save_mcp(servers: list) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = MCP_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps({"servers": servers}, indent=1))
-    tmp.replace(MCP_PATH)
+    _replace_with_retry(tmp, MCP_PATH)
 # Mirrors frontend/dist/settings-registry.js. The registry is the source of
 # truth for the UI; this is the storage contract, and load_settings() drops
 # unknown keys and defaults missing ones so a hand-edited or older file can
@@ -748,10 +776,11 @@ class DpapiSecretStore:
         result = Blob()
         crypt32 = ctypes.windll.crypt32
         call = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
-        args = ([ctypes.byref(source), None, None, None, None, 0, ctypes.byref(result)]
-                if protect else
-                [ctypes.byref(source), None, None, None, None, 0, ctypes.byref(result)])
-        if not call(*args):
+        # Both functions take the same seven arguments: the blob in, a
+        # description, optional entropy, a reserved pointer, a prompt struct,
+        # flags, and the blob out.
+        if not call(ctypes.byref(source), None, None, None, None, 0,
+                    ctypes.byref(result)):
             raise OSError("DPAPI call failed")
         try:
             return ctypes.string_at(result.pbData, result.cbData)
@@ -759,14 +788,23 @@ class DpapiSecretStore:
             ctypes.windll.kernel32.LocalFree(result.pbData)
 
     def _read(self):
+        """The stored secrets, or {} if there are none.
+
+        A missing file means "nothing stored yet". A file that will not decrypt
+        means something else entirely -- a Windows password reset or a roamed
+        profile can invalidate the DPAPI key -- and treating that as empty made
+        the next `set` write a fresh blob over it, destroying every other
+        secret in the file. So only absence is silent.
+        """
         try:
-            return json.loads(self._crypt(self.path.read_bytes(), False).decode("utf-8"))
-        except Exception:  # noqa: BLE001
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
             return {}
+        return json.loads(self._crypt(raw, False).decode("utf-8"))
 
     def set(self, name: str, value: str) -> bool:
         try:
-            store = self._read()
+            store = self._read()          # raises if the blob will not decrypt
             if value:
                 store[name] = value
             else:
@@ -781,7 +819,10 @@ class DpapiSecretStore:
             return False
 
     def get(self, name: str) -> str:
-        return str(self._read().get(name, ""))
+        try:
+            return str(self._read().get(name, ""))
+        except Exception:  # noqa: BLE001 - unreadable is not the caller's problem
+            return ""
 
 
 class FileSecretStore:
@@ -796,11 +837,20 @@ class FileSecretStore:
         self.path = pathlib.Path(data_dir) / "secrets.json"
 
     def _read(self) -> dict:
+        """The stored secrets, or {} if there are none.
+
+        Only absence is silent. Swallowing every error here meant one transient
+        read failure -- or a partly written file -- read as "empty", and the
+        next `set` wrote a fresh file over the top, destroying every other
+        secret in it. The DPAPI store's docstring names this exact hazard; this
+        one was left with it.
+        """
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (OSError, ValueError):
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return {}
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
 
     def set(self, name: str, value: str) -> bool:
         try:
@@ -811,9 +861,17 @@ class FileSecretStore:
                 store.pop(name, None)
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".json.tmp")
-            # Created 0600 *before* anything is written to it, so the secret is
-            # never briefly world-readable between creation and chmod.
-            handle = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # O_EXCL, not just O_CREAT: the mode argument applies only when
+            # the file is *created*, so a leftover temp file from an
+            # interrupted write keeps its old permissions and the secret goes
+            # into it world-readable until the chmod after the rename. On
+            # Linux ~/.local/share is 0755, so that window is real. O_EXCL
+            # also closes the symlink-follow hole.
+            try:
+                os.unlink(str(tmp))
+            except FileNotFoundError:
+                pass
+            handle = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(handle, "w", encoding="utf-8") as out:
                 json.dump(store, out)
             _replace_with_retry(tmp, self.path)
@@ -826,7 +884,10 @@ class FileSecretStore:
             return False
 
     def get(self, name: str) -> str:
-        return str(self._read().get(name, ""))
+        try:
+            return str(self._read().get(name, ""))
+        except Exception:  # noqa: BLE001 - unreadable is not the caller's problem
+            return ""
 
 
 class FallbackSecretStore:
@@ -846,8 +907,32 @@ class FallbackSecretStore:
         return self.secondary.path
 
     def set(self, name: str, value: str) -> bool:
+        """Write to the best store that will take it -- but delete from both.
+
+        A delete that stopped at the first success left the other copy behind,
+        and `get` served it: clearing an API key reported success while the key
+        kept working and its plaintext stayed on disk. The same applies to a
+        *new* value, which must not leave the superseded one readable in the
+        fallback, so the secondary is cleared after a successful primary write.
+        """
+        if not value:
+            # `and`, not `or`: a delete has only succeeded if the secret is
+            # gone from everywhere it could be read from. With `or`, an
+            # unwritable file store meant the plaintext copy survived, `get`
+            # served it, and the user was told the key had been removed.
+            cleared_primary = self.primary.set(name, "")
+            cleared_secondary = self.secondary.set(name, "")
+            return cleared_primary and cleared_secondary
         if self.primary.set(name, value):
+            self.secondary.set(name, "")   # never leave a stale plaintext copy
             return True
+        # The primary could not take the new value. If it still holds the old
+        # one, `get` would keep serving that -- the user saves a new key, is
+        # told it worked, and the app goes on using the previous one. Clearing
+        # the primary first is what makes the fallback reachable; if even that
+        # fails there is nowhere safe to put this.
+        if self.primary.get(name) and not self.primary.set(name, ""):
+            return False
         return self.secondary.set(name, value)
 
     def get(self, name: str) -> str:
@@ -912,7 +997,7 @@ def save_settings(patch: dict) -> dict:
     # Secrets never reach the file.
     on_disk = {k: v for k, v in merged.items() if k not in SECRET_KEYS}
     tmp.write_text(json.dumps(on_disk, indent=1))
-    tmp.replace(SETTINGS_PATH)
+    _replace_with_retry(tmp, SETTINGS_PATH)
     # Settings change the agent's identity, so cached agents must go or the
     # next turn would silently run on the previous model.
     with _agent_lock:
@@ -1061,6 +1146,53 @@ def _get_agent(session_id: str = "default", tools: bool = True):
         return _agents[key]
 
 
+def _seed_history(agent, chat_id: str) -> int:
+    """Give the agent the conversation the user can already see.
+
+    The history existed in two places and only one of them was durable: the
+    transcript on disk, which the sidebar renders, and the agent's
+    chat_history, which is what the model is actually shown. Nothing ever
+    copied the first into the second.
+
+    The agent cache is a plain dict in this process (`_agents`), so it is empty
+    after any restart; `save_settings` clears it outright, because a model
+    change must not run on the previous agent; and the tools toggle keys a
+    *different* agent for the same session. After any of those, reopening a
+    chat showed the user their whole conversation while the model was handed a
+    blank slate -- and it said so: "I don't have access to your previous
+    questions. Each session is treated independently."
+
+    Only when the agent has nothing. An agent mid-session already holds the
+    turns, including tool messages this transcript never stored, and replaying
+    over the top would duplicate them.
+
+    Returns how many messages were replayed, for the log.
+    """
+    try:
+        if agent.chat_history:
+            return 0
+    except Exception:  # noqa: BLE001 - an agent without the attribute is not ours to seed
+        return 0
+    try:
+        stored = load_chat(chat_id).get("messages") or []
+    except Exception:  # noqa: BLE001 - a missing or broken transcript is not fatal
+        return 0
+
+    replayed = 0
+    for message in stored:
+        role, content = message.get("role"), message.get("content")
+        # Only the two roles a transcript holds, and never a blank turn: an
+        # empty assistant message is what a failed turn leaves behind, and
+        # feeding it back teaches the model that silence is an acceptable
+        # answer.
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            agent._append_to_chat_history({"role": role, "content": content})
+            replayed += 1
+    if replayed:
+        log(f"replayed {replayed} messages into the agent for chat {chat_id}")
+    return replayed
+
+
 # --- stream protocol v2 -------------------------------------------------------
 # v1 carried only start/delta/end/error, which is enough to print text and
 # nothing else. Tool calls, reasoning and usage have to be first-class events or
@@ -1070,15 +1202,26 @@ def _get_agent(session_id: str = "default", tools: bool = True):
 # Every event carries `msg_id` so the client can address a specific message
 # rather than assuming the last one is the live one.
 #
-#   start        {msg_id}
-#   reasoning    {msg_id, text}          incremental, collapsible
-#   delta        {msg_id, text}          assistant text
-#   tool_call    {msg_id, call_id, name, args}
-#   tool_result  {msg_id, call_id, name, ok, output, seconds}
-#   usage        {msg_id, chars, seconds, ttft}
-#   cancelled    {msg_id, run_id}
-#   error        {msg_id, message, kind}
-#   end          {msg_id}
+# This list is the whole vocabulary: eleven events, no more. A client written
+# against a subset silently ignores the rest, so approval_request in particular
+# -- the human-in-the-loop tool gate -- must appear here or the run blocks
+# invisibly until its timeout. It is not a comment that can drift silently --
+# the StreamProtocolVocabulary test in test_portability.py parses these names
+# *and* every emit(...) / _emit_now(...) call site and asserts the two sets
+# match in both directions, so a new event with no line here (or a line here
+# with no emitter) fails CI.
+#
+#   start            {msg_id, run_id}
+#   reasoning        {msg_id, text}          incremental, collapsible
+#   delta            {msg_id, text}          assistant text
+#   tool_drafting    {msg_id, name}          "preparing tool..." before the call
+#   tool_call        {msg_id, call_id, name, args}
+#   tool_result      {msg_id, call_id, name, ok, output, seconds}
+#   approval_request {msg_id, approval_id, call_id, name, args}  human-in-the-loop gate
+#   usage            {msg_id, chars, seconds, ttft}
+#   cancelled        {msg_id, run_id}
+#   error            {msg_id, message, kind}
+#   end              {msg_id, user_index, assistant_index, versions, active}
 
 def _classify_stream_item(item):
     """Map one yielded item onto a protocol event.
@@ -1267,11 +1410,27 @@ class Handler(BaseHTTPRequestHandler):
         while True:
             events, gap = run.since(cursor)
             if gap:
-                # Say so rather than handing over events with a hole in them.
+                # Say so rather than handing over events with a hole in them,
+                # then resume at the oldest event still held.
+                #
+                # Resuming at -1 instead made the *next* since() compute a gap
+                # again -- every ring that has ever evicted satisfies
+                # `0 < oldest` -- so the stream resynced forever, and the
+                # `continue` skipped both the sleep and the terminal check.
+                # A run past 4000 events (about twenty minutes of tqdm) showed
+                # the viewer nothing at all while pinning a core, and kept
+                # doing so after the run had finished. Falling through here
+                # delivers the events instead of discarding them.
                 self.wfile.write(b"event: resync\ndata: {}\n\n")
                 self.wfile.flush()
-                cursor = -1
-                continue
+                # Resume at the oldest event still held. A gap always comes
+                # with events -- since() returns early on an empty buffer, and
+                # a gap means every held event is newer than the cursor -- so
+                # this is really `events[0][0] - 1`; the fallback is there so a
+                # future change to since() cannot turn this into an
+                # IndexError. The fix was removing the `continue` that used to
+                # follow: without it the loop falls through and delivers them.
+                cursor = events[0][0] - 1 if events else cursor
             for c, kind, payload in events:
                 cursor = c
                 body = json.dumps({"cursor": c, **payload})
@@ -1301,7 +1460,13 @@ class Handler(BaseHTTPRequestHandler):
             if run is None:
                 self._json({"ok": False, "error": "no such run"}, 404)
                 return
-            cursor = int((query.get("cursor") or ["-1"])[0])
+            try:
+                cursor = int((query.get("cursor") or ["-1"])[0])
+            except ValueError:
+                # A malformed cursor used to escape as an unhandled exception,
+                # which drops the connection with no response at all.
+                self._json({"ok": False, "error": "cursor must be an integer"}, 400)
+                return
             try:
                 self._train_progress(run, cursor)
             except (BrokenPipeError, ConnectionResetError):
@@ -1309,14 +1474,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/train/runs":
-            self._json({"runs": [r.summary() for r in self._training().history[:50]]})
+            # list() first: history is a bounded deque, which cannot be
+            # sliced. The cap is MAX_HISTORY, so this slice is belt and braces.
+            history = list(self._training().history)[:50]
+            self._json({"runs": [r.summary() for r in history]})
             return
 
         if self.path.startswith("/train/status"):
             trainer = self._training()
             run = trainer.current
             self._json({"run": run.summary() if run else None,
-                        "metrics": run.metrics[-500:] if run else []})
+                        # list() first: metrics is a bounded deque, and a
+                        # deque cannot be sliced.
+                        "metrics": list(run.metrics)[-500:] if run else []})
             return
 
         if self.path == "/settings":
@@ -1380,8 +1550,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         # ok:true plus a version, so the supervisor can tell "engine healthy"
-        # from "something else answered on this port".
-        body = json.dumps({"ok": True, "version": PROTOCOL_VERSION}).encode()
+        # from "something else answered on this port". data_dir is included
+        # because the UI offers to copy that path, and it can be overridden by
+        # PRAISONAI_DESKTOP_HOME or XDG_DATA_HOME -- so the page must ask
+        # rather than reproduce the default and hand the user a path the app
+        # is not actually using.
+        body = json.dumps({"ok": True, "version": PROTOCOL_VERSION,
+                           "data_dir": str(DATA_DIR)}).encode()
         self.send_response(200)
         self._cors()
         self.send_header("Content-Type", "application/json")
@@ -1408,6 +1583,9 @@ class Handler(BaseHTTPRequestHandler):
                             "config needs at least model_name and dataset"}, 400)
                 return
             try:
+                # Reject what cannot work before a single byte is downloaded.
+                from training import check_method_requirements
+                check_method_requirements(config)
                 run = self._training().start(config, payload.get("run_id"))
             except ValueError as exc:
                 # A rejected run id is the caller's fault, not the server's.
@@ -1418,12 +1596,27 @@ class Handler(BaseHTTPRequestHandler):
                 # should show the running job, not a traceback.
                 self._json({"ok": False, "error": str(exc)}, 409)
                 return
+            except OSError as exc:
+                # An unwritable runs directory escaped as an unhandled
+                # exception, so the connection dropped with no response and
+                # the UI reported "could not reach the engine" -- sending the
+                # user after the wrong problem entirely.
+                self._json({"ok": False, "error":
+                            f"could not create the run directory: {exc}"}, 500)
+                return
             self._json({"ok": True, "run": run.summary()})
             return
 
-        if self.path.startswith("/train/stop"):
+        # Parse the path, don't pattern-match the raw string. rsplit("/") on
+        # "/train/stop/<stale-id>/" yielded "", which is falsy -- so the
+        # stale-tab guard was skipped and a stale tab killed whatever run was
+        # live. A bare startswith() also matched "/train/stopXXXX", and a
+        # query string ("?force=1") was read as part of the run id, so a
+        # legitimate stop was refused.
+        route = urlparse(self.path).path
+        if route == "/train/stop" or route.startswith("/train/stop/"):
             self._drain()
-            run_id = self.path.rsplit("/", 1)[-1] if "/train/stop/" in self.path else None
+            run_id = route[len("/train/stop"):].strip("/") or None
             try:
                 stopped = self._training().stop(run_id)
             except RuntimeError as exc:
@@ -1666,16 +1859,23 @@ class Handler(BaseHTTPRequestHandler):
             _tool_queue().clear()
             _apply_env(load_settings())
             agent = _get_agent(session, tools=tools_on)
+            # Before the turn, not at construction: the agent is cached per
+            # session and the transcript is per chat, and a settings change
+            # can drop the agent between one turn and the next.
+            _seed_history(agent, chat_id)
             emit("start", {"run_id": run_id})
             streamed = False
+            tools_shown = 0
             def _emit_drafting(name):
                 emit("tool_drafting", {"name": name})
 
             def _drain_tools():
                 """Emit any tool activity recorded since the last check."""
+                shown = 0
                 q = _tool_queue()
                 while q:
                     ev = q.pop(0)
+                    shown += 1
                     _emit_drafting(ev["name"])
                     emit("tool_call", {"call_id": ev["call_id"], "name": ev["name"],
                                        "args": ev["args"]})
@@ -1683,6 +1883,7 @@ class Handler(BaseHTTPRequestHandler):
                     emit("tool_result", {"call_id": ev["call_id"], "name": ev["name"],
                                          "ok": ev["ok"], "output": ev["output"],
                                          "seconds": ev["seconds"]})
+                return shown
 
             for chunk in agent.start(prompt, stream=True,
                                      **_llm_overrides(load_settings())):
@@ -1717,6 +1918,11 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     emit(event, frame)
             else:
+                # Tool activity belongs to the user even when the turn failed.
+                # Draining only on the success path meant a turn that ran tools
+                # and then died showed neither the answer nor the tools -- the
+                # work happened and left no trace.
+                tools_shown += _drain_tools()
                 if not streamed:
                     # A stream that yielded nothing is a failure, not an empty
                     # answer -- and the cause is usually in the logs, not here.
@@ -1729,11 +1935,19 @@ class Handler(BaseHTTPRequestHandler):
                     elif captured:
                         emit("error", {"kind": "internal",
                                        "message": captured[-1][:300]})
+                    elif tools_shown:
+                        # Not the same failure as "nothing happened". The tools
+                        # ran and their results are on screen; what is missing
+                        # is the model's answer about them. Saying "no output"
+                        # here described the turn to the user as a dead end
+                        # when most of it had in fact succeeded.
+                        emit("error", {"kind": "no_answer", "message":
+                             f"{tools_shown} tool call(s) ran, but the model "
+                             "sent no answer afterwards. Their results are above."})
                     else:
                         emit("error", {"message": "the engine produced no output",
                                        "kind": "empty"})
                 else:
-                    _drain_tools()
                     elapsed = time.perf_counter() - started
                     user_index = _persist(chat_id, prompt, reply, regenerate_of)
                     if cfg_now.get("show_stats", True):
