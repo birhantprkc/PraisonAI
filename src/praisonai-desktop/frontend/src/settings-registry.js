@@ -172,7 +172,12 @@ const SETTINGS = [
 
   // ---- About --------------------------------------------------------------
   { key: "version", section: "about", label: "PraisonAI Desktop",
-    control: { kind: "readout", value: () => "0.1.0" } },
+    control: { kind: "readout", value: () =>
+      globalThis.__PRAISONAI_DESKTOP_VERSION__ || "unknown" } },
+
+  { key: "agents_version", section: "about", label: "PraisonAI Agents",
+    control: { kind: "readout", value: () =>
+      globalThis.__PRAISONAI_AGENTS_VERSION__ || "unknown" } },
 
   { key: "engine_status", section: "about", label: "Engine",
     description: "The Python process this window is talking to.",
@@ -186,7 +191,7 @@ const SETTINGS = [
 
   // ---- Integrations -------------------------------------------------------
   { key: "mcp_servers", section: "integrations", label: "MCP servers",
-    description: "Tool servers launched over stdio. Each is disabled until you enable it.",
+    description: "Saved for a future release. Servers listed here are stored only \u2014 the engine does not launch them yet, so the model cannot use them.",
     keywords: ["tools", "model context protocol", "stdio", "extensions"],
     control: { kind: "action", verb: "Manage" }, action: "mcp" },
 ];

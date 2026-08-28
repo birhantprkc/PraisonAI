@@ -20,7 +20,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -129,6 +129,34 @@ class ChatStream(unittest.TestCase):
         self.assertIn("tool_result", kinds, f"the tool result was never shown: {kinds}")
         results = [d for k, d in frames if k == "tool_result"]
         self.assertEqual(results[0]["output"], "2026-08-27 00:13:35")
+
+    def test_a_stream_that_yielded_something_first_still_counts_its_tools(self):
+        # Every tool-then-die test above uses chunks=(), which is the one path
+        # where the loop body never runs -- so the drain inside the loop was
+        # never exercised and its discarded return value went unnoticed. One
+        # frame of anything is enough to take the other path.
+        self._install(chunks=[{"type": "reasoning", "text": "thinking"}], tools=[_tool()])
+        frames = self._chat()
+        errors = [d for k, d in frames if k == "error"]
+        self.assertTrue(errors, "no error was reported")
+        self.assertEqual(
+            errors[0].get("kind"), "no_answer",
+            "a stream that yielded a non-text frame lost its tool count")
+        self.assertIn("1 tool call(s)", errors[0]["message"])
+
+    def test_an_empty_text_chunk_does_not_lose_the_tool_count(self):
+        self._install(chunks=[""], tools=[_tool()])
+        errors = [d for k, d in self._chat() if k == "error"]
+        self.assertTrue(errors, "no error was reported")
+        self.assertEqual(errors[0].get("kind"), "no_answer")
+
+    def test_tools_are_counted_once_not_twice(self):
+        # The queue is drained in two places now. Counting the same event in
+        # both would inflate the number the user is shown.
+        self._install(chunks=[{"type": "reasoning", "text": "x"}],
+                      tools=[_tool("a"), _tool("b")])
+        errors = [d for k, d in self._chat() if k == "error"]
+        self.assertIn("2 tool call(s)", errors[0]["message"])
 
     def test_the_message_says_how_many_tools_ran(self):
         self._install(chunks=(), tools=[_tool("a"), _tool("b")])
@@ -282,6 +310,89 @@ class HistoryAcrossSessions(unittest.TestCase):
         agent = self._say("second", ["two"])
         self.assertTrue(all(t.strip() for _, t in self._roles_and_text(agent)),
                         f"a blank turn was replayed: {agent.seen_history}")
+
+
+class FetchUrlDoesNotFollowRedirects(unittest.TestCase):
+    """The approval card names one URL; the fetch must not reach another.
+
+    urllib.request.urlopen follows 3xx by default, so a page the user approved
+    could 302 the fetch to any host or port -- including this engine on
+    loopback -- and its body would land back in the model's context under an
+    approval that never named it. This stands up two servers: A returns a 302
+    to B, B returns a secret. The gate is set to allow, and A's URL is
+    fetched. The secret from B must not come back.
+    """
+
+    def _fetch_url(self):
+        """The fetch_url closure out of _builtin_tools()."""
+        for tool in server._builtin_tools():
+            if getattr(tool, "__name__", "") == "fetch_url":
+                return tool
+        self.fail("fetch_url is no longer a builtin tool")
+
+    def setUp(self):
+        server._tool_queue().clear()
+        # approval_mode "never" makes the gate allow without a stream to ask on.
+        self._orig = server.load_settings
+        server.load_settings = lambda: dict(self._orig(), approval_mode="never")
+
+        secret = "SECRET-BODY-9c1f"
+        # A request reaching B is a breach on its own -- the fetch is a side
+        # effect (it can trigger actions, log the caller, exhaust rate limits)
+        # regardless of whether its body ever comes back. So the test records
+        # that B was contacted, not just that its body leaked.
+        b_hits = []
+
+        class _Secret(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # noqa: A003 - quiet
+                pass
+
+            def do_GET(inner):  # noqa: N805
+                b_hits.append(inner.path)
+                inner.send_response(200)
+                inner.send_header("Content-Length", str(len(secret)))
+                inner.end_headers()
+                inner.wfile.write(secret.encode())
+
+        self.secret = secret
+        self.b_hits = b_hits
+        self.b = ThreadingHTTPServer(("127.0.0.1", 0), _Secret)
+        b_url = f"http://127.0.0.1:{self.b.server_address[1]}/leak"
+
+        class _Redirect(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # noqa: A003 - quiet
+                pass
+
+            def do_GET(inner):  # noqa: N805
+                inner.send_response(302)
+                inner.send_header("Location", b_url)
+                inner.send_header("Content-Length", "0")
+                inner.end_headers()
+
+        self.a = ThreadingHTTPServer(("127.0.0.1", 0), _Redirect)
+        self.a_url = f"http://127.0.0.1:{self.a.server_address[1]}/blog"
+        for srv in (self.a, self.b):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        server.load_settings = self._orig
+        for srv in (self.a, self.b):
+            srv.shutdown()
+            srv.server_close()
+
+    def test_a_redirect_does_not_reach_the_unapproved_target(self):
+        result = self._fetch_url()(self.a_url)
+        self.assertNotIn(self.secret, result,
+                         "the approved URL redirected to an unapproved host "
+                         "and its body was returned anyway")
+        self.assertEqual(self.b_hits, [],
+                         "the unapproved redirect target was contacted at all")
+
+    def test_the_body_of_the_approved_url_still_comes_back(self):
+        # A page that does not redirect must still be fetched normally.
+        result = self._fetch_url()(f"http://127.0.0.1:{self.b.server_address[1]}/leak")
+        self.assertIn(self.secret, result,
+                      "a direct, approved fetch stopped working")
 
 
 if __name__ == "__main__":

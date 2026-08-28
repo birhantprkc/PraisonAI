@@ -309,7 +309,15 @@ def _chat_path(cid: str) -> pathlib.Path:
 
 def load_chat(cid: str) -> dict:
     try:
-        return json.loads(_chat_path(cid).read_text())
+        chat = json.loads(_chat_path(cid).read_text())
+        if not isinstance(chat, dict):
+            # Valid JSON, wrong shape -- the app's own export is a list. Every
+            # caller does chat.get(...), so a non-dict escapes as AttributeError
+            # and drops the connection. /projects and /search both call this on
+            # the same files list_chats() walks, so hardening only list_chats()
+            # left those two routes crashing on exactly the file this fixes.
+            raise ValueError("not a chat object")
+        return chat
     except (OSError, ValueError):
         # Absent and corrupt are answered the same way here on purpose: the
         # caller is opening a conversation, and either way there is nothing to
@@ -336,6 +344,9 @@ def list_chats() -> list:
     for f in CHATS_DIR.glob("*.json"):
         try:
             c = json.loads(f.read_text())
+            if not isinstance(c, dict):
+                # Valid JSON, wrong shape -- the app's own export is a list.
+                raise ValueError("not a chat object")
             out.append({
                 "id": c.get("id", f.stem),
                 "title": c.get("title") or "New chat",
@@ -598,14 +609,27 @@ def _builtin_tools():
             url: An http(s) URL.
         """
         import re as _re
+        import urllib.error as _e
         import urllib.request as _r
 
         if not url.startswith(("http://", "https://")):
             return "Only http and https URLs are supported."
         if not _gate("fetch_url", {"url": url}):
             return "The user declined this tool call."
+
+        # The user approved *this* URL. A 3xx would fetch a different one --
+        # any host, any port, including this engine on loopback -- under the
+        # same approval, which makes the card a lie about what happens. Refuse
+        # the redirect and say so, so the model can ask for the new URL and
+        # get a second card rather than silently reaching an unapproved host.
+        class _NoRedirect(_r.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise _e.HTTPError(req.full_url, code,
+                                   f"redirect to {newurl} was not approved",
+                                   headers, fp)
+
         try:
-            with _r.urlopen(url, timeout=20) as resp:
+            with _r.build_opener(_NoRedirect).open(url, timeout=20) as resp:
                 body = resp.read(400_000).decode("utf-8", "replace")
         except Exception as exc:  # noqa: BLE001
             return f"Fetch failed: {type(exc).__name__}: {exc}"
@@ -707,10 +731,18 @@ class KeychainSecretStore:
                                check=True, capture_output=True, timeout=10,
                                **_quiet_subprocess_kwargs())
             else:
-                subprocess.run(["security", "delete-generic-password",
-                                "-s", KEYCHAIN_SERVICE, "-a", name],
-                               capture_output=True, timeout=10,
-                               **_quiet_subprocess_kwargs())
+                # The write path above checks its exit status; this one did
+                # not, and returned True regardless. A locked keychain leaves
+                # the item intact, so "your key was removed" was reported
+                # while the credential stayed live and came back on the next
+                # launch. 44 is "no such item", which is a delete that has
+                # already happened.
+                removed = subprocess.run(
+                    ["security", "delete-generic-password",
+                     "-s", KEYCHAIN_SERVICE, "-a", name],
+                    capture_output=True, timeout=10,
+                    **_quiet_subprocess_kwargs())
+                return removed.returncode in (0, 44)
             return True
         except Exception:  # noqa: BLE001 - a keychain failure must not lose the turn
             return False
@@ -740,9 +772,15 @@ class SecretToolSecretStore:
                                input=value.encode(), check=True,
                                capture_output=True, timeout=10)
             else:
-                subprocess.run(["secret-tool", "clear",
-                                "service", KEYCHAIN_SERVICE, "account", name],
-                               capture_output=True, timeout=10)
+                # As above: unchecked, so an unavailable D-Bus session (a
+                # headless or SSH login) reported a delete that never
+                # happened. `secret-tool clear` exits 0 when it matches
+                # nothing, so a non-zero status here is a real failure.
+                cleared = subprocess.run(
+                    ["secret-tool", "clear",
+                     "service", KEYCHAIN_SERVICE, "account", name],
+                    capture_output=True, timeout=10)
+                return cleared.returncode == 0
             return True
         except Exception:  # noqa: BLE001
             return False
@@ -1556,6 +1594,9 @@ class Handler(BaseHTTPRequestHandler):
         # rather than reproduce the default and hand the user a path the app
         # is not actually using.
         body = json.dumps({"ok": True, "version": PROTOCOL_VERSION,
+                           "shell_version": os.environ.get(
+                               "PRAISONAI_DESKTOP_VERSION", "unknown"),
+                           "agents_version": _installed_version(),
                            "data_dir": str(DATA_DIR)}).encode()
         self.send_response(200)
         self._cors()
@@ -1570,8 +1611,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             _chat_path(self.path.rsplit("/", 1)[-1]).unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
+        except ValueError as exc:
+            self._json({"ok": False, "error": str(exc)}, 400)
+            return
+        except OSError as exc:
+            # Reporting a delete that did not happen is how a conversation
+            # closed on screen and was back in the sidebar on reopen.
+            self._json({"ok": False, "error": str(exc)}, 500)
+            return
         self._json({"ok": True})
 
     def do_POST(self):
@@ -1657,11 +1704,16 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 self.send_error(400)
                 return
-            saved = save_settings(patch)
             if "launch_at_login" in patch:
-                saved = dict(saved)
-                saved["launch_at_login_result"] = set_launch_at_login(
-                    bool(patch["launch_at_login"]))
+                # Persist what actually happened, not what was asked. Writing
+                # the request first made the toggle report a login item that
+                # was never registered -- and survive restarts saying so.
+                result = set_launch_at_login(bool(patch["launch_at_login"]))
+                patch = {**patch, "launch_at_login": bool(result.get("enabled"))}
+                saved = dict(save_settings(patch))
+                saved["launch_at_login_result"] = result
+            else:
+                saved = save_settings(patch)
             self._json(saved)
             return
 
@@ -1887,7 +1939,13 @@ class Handler(BaseHTTPRequestHandler):
 
             for chunk in agent.start(prompt, stream=True,
                                      **_llm_overrides(load_settings())):
-                _drain_tools()
+                # Counted here too. This call drains the queue, so discarding
+                # its result meant the tally further down always read zero
+                # unless the loop body never ran at all -- and the tests only
+                # covered that one case, so the count looked right while every
+                # stream that yielded anything before dying still reported
+                # "the engine produced no output" under its own tool cards.
+                tools_shown += _drain_tools()
                 if run_id and _is_cancelled(run_id):
                     # Verified by side effect: emission stops. The client is told
                     # explicitly rather than inferring it from a stream that ends.
@@ -1995,7 +2053,21 @@ def main():
     print(f"praisonai runtime listening on 127.0.0.1:{port}", flush=True)
     write_lock(port)
     atexit.register(clear_lock)
-    register_exit_signals(lambda *_: sys.exit(0))
+
+    def _stop_everything(*_):
+        # The trainer runs in its own session (start_new_session=True), so a
+        # signal aimed at the engine's process group never reaches it. If the
+        # engine simply exits, the fine-tune is reparented to init and keeps
+        # the GPU with nothing left that can find or stop it. Trainer.stop()
+        # terminates the trainer's own group first, so quit takes it down too.
+        if _TRAINER is not None:
+            try:
+                _TRAINER.stop()
+            except Exception:  # noqa: BLE001 - never block the quit
+                pass
+        sys.exit(0)
+
+    register_exit_signals(_stop_everything)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

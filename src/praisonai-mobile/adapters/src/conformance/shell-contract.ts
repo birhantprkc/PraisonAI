@@ -49,6 +49,12 @@ export interface ShellHarness {
   emitLifecycle(phase: LifecyclePhase): void;
   /** Live subscriber count, so a leak is provable rather than inferred. */
   listenerCount(): number;
+  /** The URLs `openExternal` actually handed the OS, in order. A shell can
+   *  validate one string and forward another, and `doesNotReject` cannot see
+   *  the difference -- so the harness surfaces the forwarded value and the
+   *  contract reads it. Every real shell can supply this; it is required rather
+   *  than optional so a shell cannot opt out of being checked. */
+  forwarded(): readonly string[];
 }
 
 const PHONE: SafeAreaInsets = { top: 47, right: 0, bottom: 34, left: 0 };
@@ -232,6 +238,38 @@ export function describeShellContract(
     // button stops exiting and the only way out is the task switcher.
     const { pressBack } = await make();
     assert.equal(pressBack(), false);
+  });
+
+  test(`${name}: unsubscribing removes the RIGHT registration of a repeated handler`, async () => {
+    // The case above registers two DIFFERENT closures, so `indexOf` and
+    // `lastIndexOf` behave identically and the mutation between them survives.
+    // React StrictMode double-invokes effects, so the same function reference
+    // being registered twice is the ordinary case, not an exotic one.
+    //
+    // Registering A, B, A and then dropping the SECOND A must leave B on top
+    // and the FIRST A beneath it. Removing the first instead leaves the stack
+    // inverted: B is buried and the back press goes to the wrong screen.
+    const { shell, pressBack } = await make();
+    const order: string[] = [];
+    const routeHandler = (): boolean => {
+      order.push("route");
+      return false; // pass it on, so the whole stack is observable
+    };
+
+    shell.onBackGesture(routeHandler);
+    shell.onBackGesture(() => {
+      order.push("modal");
+      return false;
+    });
+    const dropSecond = shell.onBackGesture(routeHandler);
+    dropSecond();
+
+    pressBack();
+    assert.deepEqual(
+      order,
+      ["modal", "route"],
+      "unsubscribing removed the wrong registration, so the stack is inverted",
+    );
   });
 
   test(`${name}: the most recently registered back handler gets first refusal`, async () => {
@@ -429,6 +467,36 @@ export function describeShellContract(
     });
     emitKeyboardHeight(291);
     assert.equal(seen, 291, "the snapshot must be current inside the callback");
+  });
+
+
+  test(`${name}: a padded URL reaches the OS trimmed, or not at all`, async () => {
+    // `url.trim()` -> `url` survived: the allowlist still refuses a padded
+    // `javascript:`, but a URL that passes validation in one form and is handed
+    // to the OS in another is the shape of a scheme-confusion bypass. And
+    // `doesNotReject` only proves the call did not throw, never that it did the
+    // right thing -- for a security boundary that gap is the whole question. So
+    // this reads what the shell FORWARDED, not merely whether it settled.
+    const harness = await make();
+    const { shell } = harness;
+    await assert.doesNotReject(() => shell.openExternal("  https://ok.example  "));
+    assert.deepEqual(
+      harness.forwarded(),
+      ["https://ok.example"],
+      "the OS must receive the trimmed URL the allowlist actually approved, not the padded input",
+    );
+    // And padding must not smuggle a refused scheme past the allowlist.
+    await assert.rejects(
+      () => shell.openExternal("  javascript:alert(1)  "),
+      "whitespace must not launder a refused scheme",
+    );
+    await assert.rejects(() => shell.openExternal("\tdata:text/html,<script>x</script>"));
+    // A refused scheme must never reach the OS, however it was padded.
+    assert.deepEqual(
+      harness.forwarded(),
+      ["https://ok.example"],
+      "a refused scheme was forwarded to the OS despite the rejection",
+    );
   });
 
 }

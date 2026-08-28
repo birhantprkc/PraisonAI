@@ -1,12 +1,12 @@
 {
   "version": "1.5.87",
-  "lastUpdated": "2026-08-27",
+  "lastUpdated": "2026-08-28",
   "generatedBy": "praisonai._dev.parity.generator",
   "sourceOfTruth": "Python SDK (praisonaiagents)",
   "summary": {
     "pythonCoreFeatures": 411,
     "pythonWrapperFeatures": 21,
-    "typescriptFeatures": 1193,
+    "typescriptFeatures": 1194,
     "gapCount": 116,
     "priorityP0": 2,
     "priorityP1": 5,
@@ -1697,6 +1697,7 @@
       "agent": [
         "Agent",
         "AgentEvent",
+        "AgentMessage",
         "AgentStreamOptions",
         "AgentTeam",
         "AgentTeamConfig",
