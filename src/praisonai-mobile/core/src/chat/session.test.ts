@@ -233,3 +233,49 @@ test("every turn advances the chat's updated time", () => {
     assert.equal(afterTwo.messages.length, 4, "and both turns are still there");
   })();
 });
+
+test("a title of exactly the maximum length is not truncated", () => {
+  // `points.length <= 60` -> `< 60` survived: a title of exactly 60 graphemes
+  // gets an ellipsis it does not need, and loses its last character to make
+  // room for it.
+  const { session } = build();
+  const exactly60 = "a".repeat(60);
+  return session.record(exactly60, "answer").then(() => {
+    const title = session.current()?.title ?? "";
+    assert.equal(title, exactly60, "a title at the limit must survive whole");
+    assert.equal(title.includes("…"), false);
+  });
+});
+
+test("a title one character over the maximum IS truncated", () => {
+  // The pair, so a function that never truncates cannot pass the test above.
+  const { session } = build();
+  return session.record("b".repeat(61), "answer").then(() => {
+    const title = session.current()?.title ?? "";
+    assert.ok(title.endsWith("…"), `expected an ellipsis, got ${JSON.stringify(title)}`);
+    assert.ok(title.length <= 60);
+  });
+});
+
+test("a title is cut on a code POINT boundary, never mid-emoji", () => {
+  // `[...line]` -> `line.split("")` survived. A long first message containing
+  // an astral character gets sliced through a surrogate pair, and the chat
+  // list row ends in a replacement character forever.
+  const emoji = "👍".repeat(80); // 80 code points, 160 code units
+  const title = titleFrom(emoji);
+
+  assert.ok(title.endsWith("…"), "a long title is elided");
+  assert.equal([...title].length, 60, "59 code points plus the ellipsis");
+  assert.ok(!title.includes("�"), "no replacement character");
+  assert.deepEqual(
+    [...title.slice(0, -1)],
+    [...emoji].slice(0, 59),
+    "every kept code point must be whole",
+  );
+});
+
+test("a title at exactly the limit is not elided -- the pair", () => {
+  // Without this, a titleFrom that always elided would pass above.
+  const sixty = "a".repeat(60);
+  assert.equal(titleFrom(sixty), sixty);
+});

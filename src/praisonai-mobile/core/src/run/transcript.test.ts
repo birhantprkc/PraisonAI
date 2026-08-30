@@ -437,3 +437,93 @@ test("a decoder refusal AFTER a turn ended reaches the next turn, not the last o
     "a refusal in the gap between turns must not be discarded with the old turn",
   );
 });
+
+test("text after a tool call keeps the tool card between the two paragraphs", () => {
+  // `blocks.slice(0, -1)` -> `slice(0, -2)` survived: appending to the trailing
+  // text block dropped the block BEFORE it as well. Any answer that keeps
+  // talking after a tool call loses the tool row and its output entirely --
+  // the user sees two paragraphs and no evidence a tool ever ran.
+  let s = initialTurn;
+  s = apply(s, { type: "start", msgId: "m1", runId: "r1" });
+  s = apply(s, { type: "delta", msgId: "m1", text: "Let me check. " });
+  s = apply(s, { type: "tool_call", msgId: "m1", callId: "c1", name: "ls", args: {} });
+  s = apply(s, { type: "tool_result", msgId: "m1", callId: "c1", name: "ls", ok: true, output: "a.txt", seconds: 0.2 });
+  s = apply(s, { type: "delta", msgId: "m1", text: "There is " });
+  s = apply(s, { type: "delta", msgId: "m1", text: "one file." });
+
+  assert.deepEqual(
+    s.blocks.map((b) => b.kind),
+    ["text", "tool", "text"],
+    "the tool card must survive text arriving after it",
+  );
+  assert.equal(s.text, "Let me check. There is one file.");
+});
+
+test("a tool_result keeps the arguments its tool_call recorded", () => {
+  // `args: existing === -1 ? {} : (state.tools[existing]?.args ?? {})` -> `{}`
+  // survived: the result WIPES the arguments the call recorded. The transcript
+  // can then no longer say what a completed tool actually ran -- and the args
+  // are what an approval row shows the user before they allow it.
+  let s = initialTurn;
+  s = apply(s, { type: "start", msgId: "m1", runId: "r1" });
+  s = apply(s, {
+    type: "tool_call", msgId: "m1", callId: "c1", name: "sh", args: { command: "rm -rf /tmp/x" },
+  });
+  assert.deepEqual(s.tools[0]?.args, { command: "rm -rf /tmp/x" }, "recorded while running");
+
+  s = apply(s, {
+    type: "tool_result", msgId: "m1", callId: "c1", name: "sh", ok: true, output: "done", seconds: 0.1,
+  });
+  assert.deepEqual(
+    s.tools[0]?.args,
+    { command: "rm -rf /tmp/x" },
+    "a finished tool must still say what it ran",
+  );
+});
+
+test("a tool_result with no matching call records empty args rather than inventing them", () => {
+  // The pair: the `existing === -1` branch is the one that must yield {}.
+  let s = initialTurn;
+  s = apply(s, { type: "start", msgId: "m1", runId: "r1" });
+  s = apply(s, {
+    type: "tool_result", msgId: "m1", callId: "orphan", name: "sh", ok: true, output: "x", seconds: 0.1,
+  });
+  assert.deepEqual(s.tools[0]?.args, {});
+});
+
+test("reasoning accumulates across chunks", () => {
+  // `reasoning: state.reasoning + event.text` -> `event.text` survived: only
+  // the LAST chunk is ever shown, so a model's visible thinking is truncated
+  // to its final fragment.
+  let s = initialTurn;
+  s = apply(s, { type: "start", msgId: "m1", runId: "r1" });
+  s = apply(s, { type: "reasoning", msgId: "m1", text: "First I will " });
+  s = apply(s, { type: "reasoning", msgId: "m1", text: "read the file." });
+  assert.equal(s.reasoning, "First I will read the file.");
+});
+
+test("a tool_result is matched by callId, never by tool NAME", () => {
+  // `findIndex((t) => t.callId === event.callId)` -> `t.name === event.name`
+  // survived. With two concurrent calls to the same tool -- which is ordinary
+  // for `bash` or `read` -- the result for the second overwrites the FIRST
+  // one's row and appends a duplicate. The wrong card shows the other call's
+  // output, and one call is stuck "running" forever.
+  //
+  // Same class as the index-pairing defect the whole callId design exists to
+  // prevent, one layer down.
+  let s = initialTurn;
+  s = apply(s, { type: "start", msgId: "m1", runId: "r1" });
+  s = apply(s, { type: "tool_call", msgId: "m1", callId: "c1", name: "bash", args: { cmd: "one" } });
+  s = apply(s, { type: "tool_call", msgId: "m1", callId: "c2", name: "bash", args: { cmd: "two" } });
+  s = apply(s, {
+    type: "tool_result", msgId: "m1", callId: "c2", name: "bash", ok: false, output: "boom", seconds: 0.1,
+  });
+
+  assert.equal(s.tools.length, 2, "resolving one call must not add a third row");
+  const first = s.tools.find((t) => t.callId === "c1");
+  const second = s.tools.find((t) => t.callId === "c2");
+  assert.equal(first?.status, "running", "the unresolved call must stay unresolved");
+  assert.deepEqual(first?.args, { cmd: "one" }, "and keep its own arguments");
+  assert.equal(second?.status, "failed", "the resolved call takes the result");
+  assert.equal(second?.output, "boom");
+});

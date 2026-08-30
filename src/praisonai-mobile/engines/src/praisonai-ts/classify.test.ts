@@ -14,6 +14,13 @@ const cases: ReadonlyArray<readonly [string, unknown, string]> = [
   ["openai bad key", new Error("401 Incorrect API key provided: sk-***"), "auth"],
   ["openai missing key", new Error("No API key provided"), "auth"],
   ["anthropic auth", new Error("authentication_error: invalid x-api-key"), "auth"],
+  // The line above does NOT hold the `authentication` alternative: it also
+  // matches `invalid[ _-]?x?-?api[ _-]?key`, so deleting `authentication`
+  // from the regex survived it. These match that alternative and nothing
+  // else -- the exact regression the source comment records as fixed.
+  ["anthropic auth, no key phrase", new Error("authentication_error"), "auth"],
+  ["authentication, spelled out", new Error("Authentication Error"), "auth"],
+  ["authentication failed", new Error("Authentication failed for the request"), "auth"],
   ["forbidden", new Error("403 Forbidden"), "auth"],
   ["openai rate limit", new Error("429 Rate limit reached for gpt-4o"), "rate_limit"],
   ["quota", new Error("You exceeded your current quota"), "rate_limit"],
@@ -55,4 +62,32 @@ test("statusOf reads the shapes providers actually throw", () => {
   assert.equal(statusOf(new Error("no status")), null);
   assert.equal(statusOf(null), null);
   assert.equal(statusOf({ status: "429" }), null, "a string status is not a status");
+});
+
+test("an HTTP 500 is transport, so the UI still offers Retry", () => {
+  // `status >= 500` -> `> 500` survived. A plain 500 -- the single most common
+  // provider failure -- would classify as `internal`, whose recovery is
+  // `none`: the user is told something went wrong and offered no way to try
+  // again. 502 and 503 are unaffected, so the boundary is exactly the case
+  // that matters most.
+  for (const status of [500, 501, 502, 503, 504]) {
+    assert.equal(classifyError({ status } as never), "transport", `HTTP ${status}`);
+  }
+});
+
+test("a 4xx is not transport, so Retry is not offered where it cannot help", () => {
+  // The pair. Classifying everything as transport offers Retry for a bad
+  // request or a revoked key, which can never succeed.
+  assert.notEqual(classifyError({ status: 400 } as never), "transport");
+  assert.notEqual(classifyError({ status: 422 } as never), "transport");
+});
+
+test("a 403 is an auth failure even when its message says nothing useful", () => {
+  // Dropping `status === 403` survived because the message-matching branch
+  // catches anything that literally contains "403" or "forbidden". A provider
+  // returning `{status: 403, message: "nope"}` then classifies as `internal`,
+  // and the user gets no route to their credentials -- which is the whole
+  // reason ErrorKind separates auth from everything else.
+  assert.equal(classifyError({ status: 403, message: "nope" } as never), "auth");
+  assert.equal(classifyError({ status: 401, message: "nope" } as never), "auth");
 });

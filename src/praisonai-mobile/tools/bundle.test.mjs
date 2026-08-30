@@ -20,8 +20,7 @@ import {
   unresolvedBareImports,
   classifyBareImports,
   FORBIDDEN_BUILTINS,
-  SIZE_BUDGET_BYTES,
-} from "./bundle.mjs";
+  SIZE_BUDGET_BYTES, isShippable } from "./bundle.mjs";
 
 /** Write a throwaway package and bundle it. */
 async function fixture(files) {
@@ -227,4 +226,36 @@ test("classifyBareImports labels each kind", () => {
   assert.equal(found.get("crypto"), "static");
   assert.equal(found.get("readline"), "dynamic");
   assert.equal(found.has("./local.js"), false);
+});
+
+test("a single fatal problem makes a bundle unshippable", () => {
+  // `problems.length > 0` -> `> 1` in build-webview.mjs survived: ONE fatal
+  // problem -- a bare external, a forbidden builtin, a top-level process.env
+  // read -- no longer failed the build. It took two to be noticed, and the
+  // whole point of the gate is that one is enough.
+  //
+  // This calls the REAL predicate. Re-implementing the comparison inline would
+  // prove only that a predicate of that shape works, not that the CLI still
+  // contains it -- which is the distinction this package keeps being bitten by.
+  assert.equal(isShippable({ problems: [] }), true, "a clean bundle ships");
+  assert.equal(isShippable({ problems: ["one fatal problem"] }), false, "one problem is enough");
+  assert.equal(isShippable({ problems: ["a", "b"] }), false);
+});
+
+test("a relative import that is external is not reported as a bare module", () => {
+  // Dropping `imported.path.startsWith(".")` survived. A relative path marked
+  // external then enters the bare map under the name "./chunk", and the gate
+  // starts reporting a module that does not exist -- or, worse, one whose
+  // first path segment collides with a forbidden builtin name.
+  const bare = classifyBareImports({
+    inputs: {
+      "app/src/main.ts": {
+        imports: [
+          { path: "./chunk.js", external: true, kind: "import-statement" },
+          { path: "node:crypto", external: true, kind: "import-statement" },
+        ],
+      },
+    },
+  });
+  assert.deepEqual([...bare.keys()], ["crypto"], "only the bare specifier is bare");
 });

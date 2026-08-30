@@ -23,7 +23,12 @@
  * that lesson: 8 of 16 mutations survived a 408-test suite.
  */
 import test from "node:test";
-import assert from "node:assert/strict";
+import rawAssert from "node:assert/strict";
+import { ledger, type Ledger } from "./assert-ledger.ts";
+
+/** How many assertions the cases below make in one run. Deleting one makes
+ *  the count short and the last case fail by name. */
+const EXPECTED_ASSERTIONS = 69;
 
 import type {
   LifecyclePhase,
@@ -66,6 +71,16 @@ export function describeShellContract(
   name: string,
   make: () => ShellHarness | Promise<ShellHarness>,
 ): void {
+  // Every assertion below is counted, and the last case in this contract
+  // asserts the total. See ./assert-ledger.ts: the break-mode fixture can
+  // only protect the first assertion in each case, and 62 of 73 were
+  // measured deletable with a green run.
+  // Declared with an explicit type rather than destructured: `assert` carries
+  // `asserts` signatures, and TS2775 refuses those through a binding pattern.
+  const counting = ledger();
+  const assert: Ledger["assert"] = counting.assert;
+  const made = counting.made;
+
   // ---- identity ----------------------------------------------------------
 
   test(`${name}: the shell says which shell it is`, async () => {
@@ -499,4 +514,62 @@ export function describeShellContract(
     );
   });
 
+  test(`${name}: a safe-area event carrying only the edges that changed is honoured`, async () => {
+    // `coerceInsets` requiring EVERY edge (`&&` -> `||`) survived: a native
+    // payload with only the edge that moved is discarded whole, and the insets
+    // stay at their stale values -- the composer sits under the home indicator
+    // after a rotation. And dropping `right` from the dedupe survived too, so a
+    // landscape notch appearing on the right was deduped away as "no change".
+    const { shell, emitInsets } = await make();
+    emitInsets({ top: 47, right: 0, bottom: 34, left: 0 });
+    assert.equal(shell.insets.bottom, 34);
+
+    // Only the right edge moves -- rotating into a notch.
+    emitInsets({ top: 0, right: 44, bottom: 21, left: 47 });
+    assert.equal(shell.insets.right, 44, "an inset change on the right edge must not be deduped away");
+    assert.equal(shell.insets.top, 0, "and the other edges must follow the same event");
+  });
+
+  test(`${name}: unsubscribing TWICE does not remove a bystander`, async () => {
+    // Dropping the `if (at !== -1)` guard before `splice(at, 1)` survived. A
+    // double unsubscribe -- a re-render, React StrictMode double-invoking an
+    // effect -- splices at index -1, which removes the LAST element: another
+    // screen's back handler silently disappears.
+    //
+    // The second call must be a no-op, not a removal of whatever happens to be
+    // at the end of the stack.
+    const { shell, pressBack } = await make();
+    const order: string[] = [];
+    const stopA = shell.onBackGesture(() => {
+      order.push("A");
+      return false;
+    });
+    shell.onBackGesture(() => {
+      order.push("B");
+      return false;
+    });
+
+    stopA();
+    stopA(); // the double unsubscribe
+
+    pressBack();
+    assert.deepEqual(order, ["B"], "the bystander handler was removed by a repeated unsubscribe");
+  });
+
+
+  // Registered last, so every case above has already run by the time it does.
+  // Not a style check: the fixture in ./contract-fixture.ts can only protect
+  // the FIRST assertion in each case, so without this an assertion can be
+  // deleted and the run just reports one test fewer. See ./assert-ledger.ts.
+  test(`${name}: this contract made every assertion it is supposed to make`, () => {
+    const actual = made();
+    rawAssert.equal(
+      actual,
+      EXPECTED_ASSERTIONS,
+      `${name}: this contract ran ${actual} assertions, not ${EXPECTED_ASSERTIONS}. ` +
+        `If you deliberately added or removed one, update the constant in ` +
+        `${'shell-contract.ts'} -- and consider whether the new assertion also needs a break ` +
+        `mode in contract-fixture.ts, which is what proves it has teeth.`,
+    );
+  });
 }

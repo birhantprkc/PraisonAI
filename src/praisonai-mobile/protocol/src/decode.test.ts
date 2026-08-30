@@ -417,3 +417,41 @@ test("anything that is not a defined choice decodes to null, never a default", (
     assert.equal(decodeApprovalChoice(bad), null, `${JSON.stringify(bad)} must not decode`);
   }
 });
+
+test("an empty type is missing_type, not unknown_event", () => {
+  // Dropping `|| type === ""` survived my own earlier test, which asserted
+  // only that the frame was REFUSED. It still is -- but as `unknown_event`
+  // with an empty detail, instead of `missing_type` with the key list. The
+  // dropped-events row then blames the engine for sending an event nobody
+  // recognises, when what actually arrived had no type at all. A reason that
+  // names the wrong failure sends whoever reads it to the wrong place.
+  const out = decodeEvent({ type: "", msg_id: "m1" });
+  assert.ok(isIgnored(out));
+  assert.equal(out.reason, "missing_type");
+  assert.match(out.detail, /msg_id/, "the detail must list what the frame DID carry");
+});
+
+test("an unrecognised type really is unknown_event, so the pair is not vacuous", () => {
+  const out = decodeEvent({ type: "thinking_budget", msg_id: "m1" });
+  assert.ok(isIgnored(out));
+  assert.equal(out.reason, "unknown_event");
+});
+
+test("a tool_result with no seconds decodes as unknown, not as zero", () => {
+  // `seconds === undefined ? null : seconds` -> `? 0 :` survived. A tool the
+  // engine never timed then renders "0.0s" -- a measurement presented as fact.
+  // `durationKnown` exists precisely to keep those apart.
+  const out = decodeEvent({
+    type: "tool_result", msg_id: "m1", call_id: "c1", name: "ls", ok: true, output: "x",
+  });
+  assert.ok(isDecoded(out));
+  assert.equal(out.event.type === "tool_result" ? out.event.seconds : "wrong", null);
+});
+
+test("a tool_result WITH seconds keeps the number it was given", () => {
+  const out = decodeEvent({
+    type: "tool_result", msg_id: "m1", call_id: "c1", name: "ls", ok: true, output: "x", seconds: 0,
+  });
+  assert.ok(isDecoded(out));
+  assert.equal(out.event.type === "tool_result" ? out.event.seconds : null, 0, "a measured zero is not unknown");
+});

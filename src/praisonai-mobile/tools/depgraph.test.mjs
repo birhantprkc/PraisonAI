@@ -24,7 +24,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { importsOf, layerOf, targetOf, matchesAllowlist, ungovernedRootsIn, violations } from "./depgraph.mjs";
+import { SIZE_BUDGET_BYTES, TARGETS } from "./bundle.mjs";
+import { importsOf, layerOf, targetOf, matchesAllowlist, ungovernedRootsIn, violations, sourceFilesUnder } from "./depgraph.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -272,4 +273,133 @@ test("the real boundaries.json accounts for every directory actually on disk", (
   // The one that will fail on somebody's future branch, which is the point.
   const real = JSON.parse(readFileSync(join(here, "boundaries.json"), "utf8"));
   assert.deepEqual(ungovernedRootsIn(join(here, ".."), real), []);
+});
+
+// ---- the checker must keep checking every kind of file it claims to --------
+
+test("a violation in a .mjs file is reported, not skipped", async () => {
+  // `entry.endsWith(".ts") || entry.endsWith(".mjs")` -> dropping the .mjs half
+  // survived: the checker silently stops walking every .mjs in the package and
+  // still prints "136 files checked, no violations". That is verbatim the
+  // failure boundaries.json's own comment warns about -- "a rule that stops
+  // covering new code while still reporting a clean pass is worse than no
+  // rule" -- and tools/ is entirely .mjs.
+  const root = tree({
+    "core/src/a.ts": "export const a = 1;",
+    "core/src/sneaky.mjs": 'import { invoke } from "@tauri-apps/api/core";\nexport const x = invoke;',
+  });
+  try {
+    const files = await importsOf(
+      [join(root, "core/src/a.ts"), join(root, "core/src/sneaky.mjs")],
+      root,
+    );
+    const found = violations(files, {
+      layers: { core: { path: "core/src", mayImport: [] } },
+      externals: { "@tauri-apps/api": ["adapters/src/tauri"] },
+      governedRoots: ["core"],
+    });
+    assert.ok(
+      found.some((v) => v.file.endsWith(".mjs")),
+      "a .mjs file that crosses a seam must be reported",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the walk collects .mjs files as well as .ts", () => {
+  // The narrower form, so the failure names the cause rather than a symptom.
+  const root = tree({
+    "core/src/a.ts": "export const a = 1;",
+    "core/src/b.mjs": "export const b = 2;",
+    "core/src/notes.md": "not source",
+  });
+  try {
+    const found = sourceFilesUnder(root, ["core"]).map((f) => f.slice(root.length + 1));
+    assert.deepEqual(
+      found.map((f) => f.split("/").pop()).sort(),
+      ["a.ts", "b.mjs"].sort(),
+      "the walk must pick up both extensions, and nothing else",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an ungoverned directory holding only .mjs is still reported", () => {
+  // The file-count walk inside `ungovernedRootsIn` had its own `.mjs` test,
+  // separate from the one in `sourceFilesUnder`. Dropping it makes a new
+  // all-.mjs top-level directory report ZERO files, so it is not flagged and
+  // passes ungoverned -- verbatim the failure boundaries.json's comment warns
+  // about, and `tools/` itself is entirely .mjs.
+  const root = tree({
+    "core/src/a.ts": "export const a = 1;",
+    "scripts/build.mjs": "export const b = 1;",
+  });
+  try {
+    assert.deepEqual(
+      ungovernedRootsIn(root, { governedRoots: ["core"], ungovernedRoots: [] }),
+      [{ name: "scripts", count: 1 }],
+      "an all-.mjs directory must be counted, not skipped",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the size budget and the webview targets are the values the gate claims", () => {
+  // `SIZE_BUDGET_BYTES` and `TARGETS` are the entire contract of the bundle
+  // gate, and both could be changed silently -- 400kB to 4MB, or the baseline
+  // moved from safari16/chrome108 to a browser no target device runs. A gate
+  // whose threshold can be edited without a failing test is a gate that can be
+  // turned off.
+  assert.equal(SIZE_BUDGET_BYTES, 400 * 1024, "the budget is what makes a dependency a decision");
+  assert.deepEqual(TARGETS, ["safari16", "chrome108"], "the WebView floor is the OS, not the current Chrome");
+});
+
+// ---- the allowlist glob is part of the gate, not a convenience -------------
+
+test("a single * does not cross a directory boundary", () => {
+  // `[^/]*` -> `.*` survived. `ui/*.ts` would then match `ui/sub/a.ts`, so
+  // every allowlist entry silently widens to cover subdirectories it was
+  // written to exclude -- and an allowlist that is broader than written is a
+  // rule that stopped applying.
+  assert.equal(matchesAllowlist("ui/*.ts", "ui/a.ts"), true);
+  assert.equal(matchesAllowlist("ui/*.ts", "ui/sub/a.ts"), false, "a single * must not cross /");
+  assert.equal(matchesAllowlist("ui/**/*.ts", "ui/sub/a.ts"), true, "** is the one that crosses");
+});
+
+test("a package named by a GLOB key is still constrained", () => {
+  // `externalAllowed` dropping `matchesAllowlist(name, pkg)` survived: a glob
+  // key like `@tauri-apps/plugin-*` stops matching, so the package falls
+  // through to "no rule" and is allowed from anywhere. The plugin imports the
+  // Tauri seam exists to contain become invisible.
+  const config = {
+    layers: { ui: { path: "ui/src", mayImport: [] }, adapters: { path: "adapters/src", mayImport: [] } },
+    externals: { "@tauri-apps/plugin-*": ["adapters/src/tauri"] },
+    governedRoots: ["ui", "adapters"],
+  };
+  const found = violations(
+    new Map([["ui/src/z.ts", ["@tauri-apps/plugin-haptics"]]]),
+    config,
+  );
+  assert.ok(
+    found.some((v) => v.specifier === "@tauri-apps/plugin-haptics"),
+    "a plugin imported from ui/ must be a violation",
+  );
+});
+
+test("the same package IS allowed from the path its rule names", () => {
+  // The pair: a rule that refused everywhere would pass the test above and
+  // make the real adapter unbuildable.
+  const config = {
+    layers: { adapters: { path: "adapters/src", mayImport: [] } },
+    externals: { "@tauri-apps/plugin-*": ["adapters/src/tauri"] },
+    governedRoots: ["adapters"],
+  };
+  const found = violations(
+    new Map([["adapters/src/tauri/haptics.ts", ["@tauri-apps/plugin-haptics"]]]),
+    config,
+  );
+  assert.deepEqual(found, []);
 });
