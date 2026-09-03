@@ -41,6 +41,8 @@ interface FakeNode {
   append(...nodes: FakeNode[]): void;
   insertBefore(node: FakeNode, ref: FakeNode | null): FakeNode;
   remove(): void;
+  focus(): void;
+  readonly isConnected: boolean;
   addEventListener(type: string, cb: (e: unknown) => void): void;
   removeEventListener(type: string, cb: (e: unknown) => void): void;
   dispatch(type: string, event: unknown): void;
@@ -62,7 +64,22 @@ export interface FakeDom {
   find(pred: (n: FakeNode) => boolean): FakeNode | null;
   /** Click an element, bubbling to delegated listeners on its ancestors. */
   click(el: FakeNode): { defaultPrevented: boolean };
+  /**
+   * Commit a field, bubbling like the real `change` event does.
+   *
+   * `change` BUBBLES in a real DOM, which is what lets one delegated listener
+   * on root hear every settings field -- the same arrangement `click` already
+   * uses here. Dispatching it on the field alone (`el.dispatch("change", {})`)
+   * only ever reaches a listener attached to that element, so a test written
+   * that way passes against a per-field listener and reports nothing at all
+   * against a delegated one. Modelling the bubble is what makes the two
+   * indistinguishable to a test, as they are to a browser.
+   */
+  change(el: FakeNode): { defaultPrevented: boolean };
   text(): string;
+  /** The element `focus()` was last called on, or null -- what a test asserts
+   *  a route change moved focus to. Mirrors `document.activeElement`. */
+  activeElement(): FakeNode | null;
 }
 
 
@@ -90,6 +107,10 @@ export function createFakeDom(): FakeDom {
   installDomGlobals();
   const listeners = new WeakMap<FakeNode, Map<string, Set<(e: unknown) => void>>>();
   const viewListeners = new Map<string, Set<(e: unknown) => void>>();
+  // The focused element, as the real `document.activeElement` would report it.
+  // A route change must MOVE this; the whole point of the focus fix is that it
+  // does, rather than leaving it on the screen the user just left.
+  let active: FakeNode | null = null;
 
   const make = (tag: string): FakeNode => {
     // Built imperatively rather than as one literal: the accessors below refer
@@ -159,7 +180,25 @@ export function createFakeDom(): FakeDom {
       const at = parent.children.indexOf(el);
       if (at !== -1) parent.children.splice(at, 1);
       el.parentElement = null;
+      // A removed element cannot keep focus. The real DOM drops focus to
+      // <body> here; the app's `restore` fallback depends on `isConnected`
+      // being false after this, so mirror it.
+      if (active === el) active = null;
     };
+    el.focus = (): void => { active = el; };
+    // Connected when a walk up parents reaches root. The app checks this before
+    // restoring focus to a saved element, because the row it came from may have
+    // been removed (e.g. the deleted chat you were viewing).
+    Object.defineProperty(el, "isConnected", {
+      get(): boolean {
+        let node: FakeNode | null = el;
+        while (node !== null) {
+          if (node === root) return true;
+          node = node.parentElement;
+        }
+        return false;
+      },
+    });
     el.addEventListener = (type: string, cb: (e: unknown) => void): void => {
       let byType = listeners.get(el);
       if (byType === undefined) { byType = new Map(); listeners.set(el, byType); }
@@ -190,8 +229,30 @@ export function createFakeDom(): FakeDom {
     },
   };
 
-  const doc = { createElement: make, defaultView: view, addEventListener() {}, getElementById: () => null };
+  const doc = {
+    createElement: make,
+    defaultView: view,
+    addEventListener() {},
+    getElementById: () => null,
+    // The app reads this before a push to remember where to return focus on the
+    // matching pop. A getter, not a snapshot, so it tracks `focus()` calls.
+    get activeElement(): FakeNode | null { return active; },
+  };
   const root = make("div");
+
+  /** Dispatch one event up the ancestor chain, as a real bubbling event does.
+   *  Shared by `click` and `change` so the two cannot drift: a delegated
+   *  listener on root must hear both or neither. */
+  const bubble = (type: string, el: FakeNode): { defaultPrevented: boolean } => {
+    const event = {
+      target: el,
+      defaultPrevented: false,
+      preventDefault(this: { defaultPrevented: boolean }) { this.defaultPrevented = true; },
+    };
+    let node: FakeNode | null = el;
+    while (node !== null) { node.dispatch(type, event); node = node.parentElement; }
+    return event;
+  };
 
   const all = (): FakeNode[] => {
     const out: FakeNode[] = [];
@@ -207,15 +268,16 @@ export function createFakeDom(): FakeDom {
     all,
     find: (pred) => all().find(pred) ?? null,
     click(el) {
-      const event = {
-        target: el,
-        defaultPrevented: false,
-        preventDefault(this: { defaultPrevented: boolean }) { this.defaultPrevented = true; },
-      };
-      let node: FakeNode | null = el;
-      while (node !== null) { node.dispatch("click", event); node = node.parentElement; }
-      return event;
+      // A real click focuses the control it lands on, so the app's "remember
+      // where to return on Back" reads the tapped row, not stale focus.
+      active = el;
+      return bubble("click", el);
     },
+    // No focus side effect: a `change` fires on a field the user is ALREADY in
+    // (or has just left), and moving focus here would paper over an app that
+    // forgot to.
+    change: (el) => bubble("change", el),
     text: () => root.textContent,
+    activeElement: () => active,
   };
 }

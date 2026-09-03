@@ -15,8 +15,8 @@ import type { AgentEnginePort } from "../../core/src/ports/agent-engine.ts";
 import type { HttpPort } from "../../core/src/ports/http.ts";
 import type { IgnoredReason } from "../../protocol/src/decode.ts";
 import type { SettingDef, SettingsFacade } from "../../core/src/settings/store.ts";
-import { clampNum } from "../../core/src/settings/store.ts";
-import { createRemoteHttpEngine } from "../../engines/src/remote-http/engine.ts";
+import type { Platform } from "./platform.ts";
+import { createRemoteHttpEngine, probeHealth } from "../../engines/src/remote-http/engine.ts";
 import type { EngineChoice } from "./engines.ts";
 import type { RunPersistence } from "../../engines/src/praisonai-ts/engine.ts";
 
@@ -28,11 +28,18 @@ export const ENGINE_PRAISONAI_TS = "praisonai-ts";
  *
  * `label` rather than the key, because a settings screen showing `maxSteps` to
  * a user is a screen written by someone who never opened it.
+ *
+ * ONLY SETTINGS THE SHIPPING APP ACTUALLY READS BELONG HERE. `model`,
+ * `temperature`, `showReasoning`, `showDiagnostics` and `apiKey` were declared
+ * ahead of consumers that do not exist -- no code path read any of them (issue
+ * #4636). A declared-but-unread setting is a control the UI promises and the
+ * app does not keep: moving it does nothing, and `showDiagnostics`'s `false`
+ * default even described a hiding that never happened, since the dropped row is
+ * rendered unconditionally. They are removed rather than half-wired; the
+ * store's secret and validation machinery stays (it is contract-tested) so a
+ * real setting can be added the day its consumer does. `registry.test.ts` pins
+ * that every declared key is one the app reads, so re-adding an inert one fails.
  */
-/** The one secret this app stores. It is the keychain lookup, so changing it
- *  silently orphans every key already on a device. */
-export const OPENAI_KEY = { slot: "openai" as const, account: "default" };
-
 export const SETTING_DEFS: readonly SettingDef[] = [
   {
     key: "engineId",
@@ -40,13 +47,20 @@ export const SETTING_DEFS: readonly SettingDef[] = [
     label: "Engine",
     help: "Which agent runtime answers. Remote talks to a PraisonAI engine over HTTP; in-process runs the agent loop on this device.",
     section: "Engine",
-    // Only what `enginesFor` can actually build in the shipping composition.
-    // ENGINE_PRAISONAI_TS was listed here and is only pushed when
-    // `createInProcess` is supplied, which main.ts does not do -- so selecting
-    // it persisted an id `selectEngine` then rejects, and the NEXT launch died
-    // at `renderFatal` with no way back except editing storage by hand. A
-    // picker must not offer a choice that bricks the app.
-    choices: [ENGINE_REMOTE_HTTP],
+    // Exactly what `appEngines` in main.ts can build -- registry.test.ts
+    // compares this list against that composition, because a picker offering
+    // an id `selectEngine` rejects is a dead end: the choice persists, the
+    // NEXT launch cannot build it, and boot dies at `renderFatal` with no way
+    // back except editing storage by hand. That is what happened when
+    // ENGINE_PRAISONAI_TS was listed here while nothing supplied
+    // `createInProcess`. It is back because main.ts supplies the factory and
+    // the engine ships as a chunk beside app.js (engines/praisonai-ts/
+    // load-agent.ts).
+    //
+    // `default` here is the WEB default; `settingDefsFor` swaps in the
+    // platform's, so the value Settings shows and the engine that answers a
+    // first launch are the same one.
+    choices: [ENGINE_REMOTE_HTTP, ENGINE_PRAISONAI_TS],
   },
   {
     key: "baseUrl",
@@ -55,55 +69,45 @@ export const SETTING_DEFS: readonly SettingDef[] = [
     help: "Only used by the remote engine.",
     section: "Engine",
   },
-  {
-    key: "model",
-    default: "gpt-4o-mini",
-    label: "Model",
-    section: "Model",
-  },
-  {
-    key: "temperature",
-    default: 0.7,
-    label: "Temperature",
-    help: "Higher is more varied. 0 is closest to repeatable.",
-    section: "Model",
-    validate: clampNum(0, 2),
-  },
-  {
-    key: "showReasoning",
-    default: false,
-    label: "Show reasoning",
-    help: "Display the model's intermediate thinking when the engine reports it.",
-    section: "Display",
-  },
-  {
-    // NOT YET CONSUMED, and unlike its neighbours this one contradicts what
-    // the app actually does: the dropped row is rendered unconditionally
-    // (ui/src/transcript/view-model.ts), so the `false` default describes a
-    // hiding that does not happen. Left declared rather than deleted because
-    // the row SHOULD be gated once a settings screen exists -- but the gate
-    // must default to showing, since a diagnostic nobody can find is the same
-    // as no diagnostic. `model`, `temperature` and `showReasoning` are also
-    // declared ahead of their consumers; the difference is that they make no
-    // claim about behaviour that already exists.
-    key: "showDiagnostics",
-    default: false,
-    label: "Show dropped events",
-    help: "Surface stream events the app could not read. Useful when an answer looks wrong.",
-    section: "Display",
-  },
-  {
-    // Never reaches StoragePort. `set()` refuses it; `setSecret` is the only
-    // way in, and there is deliberately no way back out.
-    key: "apiKey",
-    default: "",
-    label: "API key",
-    help: "Stored in the device keychain where one is available.",
-    section: "Credentials",
-    secret: true,
-    secretRef: OPENAI_KEY,
-  },
 ];
+
+/** The keys the shipping app actually reads. `engineId` in `boot.ts`, `baseUrl`
+ *  in `enginesFor` below. Exported so the test that forbids an inert setting
+ *  compares `SETTING_DEFS` against a list an author has to consciously extend
+ *  in the same commit that adds the code reading the new key. */
+/**
+ * The engine to start with when settings name none, by platform.
+ *
+ * On a device, the in-process engine: a phone has no `127.0.0.1:8765` to
+ * reach, and a cleartext localhost address is refused by iOS ATS and Android
+ * besides, so the remote default was a first prompt that failed with a status
+ * code. Now that the engine ships as a chunk beside app.js, it is the one
+ * choice that works with nothing configured -- up to the model itself, which
+ * still needs a key the app has no setting for yet.
+ *
+ * On the web, the remote engine: there is a server to talk to, and no reason
+ * to fetch 1.3MB of engine into a browser tab first. `Platform["kind"]` is
+ * only `"tauri" | "web"`, so desktop Tauri (`cargo tauri dev`) counts as a
+ * device here and starts in-process too; a developer with a server running
+ * switches in Settings, and the persisted `engineId` wins over this
+ * (`chosenStringOr` in boot.ts), so it only ever decides the very first launch.
+ *
+ * Exported, and called by `settingDefsFor`, so the boot fallback and the
+ * def's `default` cannot disagree -- Settings would show one engine while
+ * another answered.
+ */
+export function defaultEngineIdFor(kind: Platform["kind"]): string {
+  return kind === "tauri" ? ENGINE_PRAISONAI_TS : ENGINE_REMOTE_HTTP;
+}
+
+/** SETTING_DEFS with the engine default the platform actually starts on. */
+export function settingDefsFor(kind: Platform["kind"]): readonly SettingDef[] {
+  return SETTING_DEFS.map((def) =>
+    def.key === "engineId" ? { ...def, default: defaultEngineIdFor(kind) } : def,
+  );
+}
+
+export const CONSUMED_SETTING_KEYS: readonly string[] = ["engineId", "baseUrl"];
 
 export interface RegistryDeps {
   readonly settings: SettingsFacade;
@@ -111,12 +115,14 @@ export interface RegistryDeps {
   /**
    * Builds the in-process engine.
    *
-   * Injected rather than imported, because `praisonai` is not a dependency of
-   * this package and cannot be until it is bundleable for a webview -- issue
-   * #4437: `crypto` and `events` are static imports on its Agent graph, so the
-   * bundle dies at import time before any code runs. Keeping it an injection
-   * means the app builds and runs today with the remote engine, and gains the
-   * in-process one by passing a factory rather than by a refactor.
+   * Injected rather than imported, because tools/boundaries.json lets only
+   * engines/src/praisonai-ts name `praisonai` -- that seam is what makes the
+   * framework swappable, and this file sits above it. The injection is also
+   * what let the app build and run with the remote engine while the in-process
+   * one could not be bundled for a webview at all (#4437: `crypto` and
+   * `events` were static imports on its Agent graph). Now `praisonai/mobile`
+   * ships as a lazy chunk and main.ts supplies the factory; the injection
+   * stays because the boundary does.
    */
   readonly createInProcess?: (persistence: RunPersistence) => AgentEnginePort | Promise<AgentEnginePort>;
   /**
@@ -152,17 +158,44 @@ function stringSetting(settings: SettingsFacade, key: string, fallback: string):
  * is not here, which is the honest message in that case.
  */
 export function enginesFor(deps: RegistryDeps): readonly EngineChoice[] {
+  /**
+   * The engine address, read at the moment it is USED.
+   *
+   * This was a `const` read once, here, and both the engine and the probe
+   * closed over the string. The app builds its engine exactly once, at boot
+   * (boot.ts), and holds it for the session -- so a phone that could not reach
+   * `127.0.0.1:8765` kept sending there no matter what was typed into
+   * Settings. The value persisted, the screen agreed, and only a relaunch
+   * changed anything: a recovery path that requires force-quitting the app.
+   *
+   * Rebuilding the engine on the change was the alternative, and it is a much
+   * larger one: `createRunController` takes the engine at construction and
+   * there is no seam to swap it, so following the setting that way means
+   * rebuilding the controller mid-session and dropping whatever turn is in
+   * flight. A resolver costs one call per request and no signature above it.
+   */
+  const baseUrl = (): string =>
+    stringSetting(deps.settings, "baseUrl", "http://127.0.0.1:8765").replace(/\/+$/, "");
   const choices: EngineChoice[] = [
     {
       id: ENGINE_REMOTE_HTTP,
       create: () =>
         createRemoteHttpEngine({
-          baseUrl: stringSetting(deps.settings, "baseUrl", "http://127.0.0.1:8765").replace(/\/+$/, ""),
+          baseUrl,
           http: deps.http,
           id: ENGINE_REMOTE_HTTP,
           // Refused frames go to the transcript instead of the floor.
           ...(deps.onIgnored === undefined ? {} : { onIgnored: deps.onIgnored }),
         }),
+      // The check the whole readiness module exists for. A 200 with
+      // `{"ok": false}` is the engine saying it is NOT ready, so trusting the
+      // status alone routes a chat into a broken engine and reports the
+      // nonsense back as a model failure. Run at selection, before the engine
+      // is offered -- the in-process engine has no remote and supplies none.
+      // Called, not captured: the probe is what produces the "not answering"
+      // warning the user is trying to clear, so probing the address they just
+      // replaced reports a failure about a machine nobody is talking to.
+      probe: () => probeHealth(deps.http, baseUrl()),
     },
   ];
 

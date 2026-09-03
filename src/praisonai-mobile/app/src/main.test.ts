@@ -8,7 +8,21 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { stopNotice } from "./main.ts";
+import { defaultEngineIdFor } from "./registry.ts";
 import { en } from "../../ui/src/i18n/strings.ts";
+
+test("a device's first-launch default is the in-process engine; the web's is remote", () => {
+  // A phone cannot reach `http://127.0.0.1:8765`, and the cleartext localhost
+  // address is refused by iOS ATS and Android -- so a remote default on a
+  // device was a first prompt that failed with a status code. The in-process
+  // engine ships as a lazy chunk beside app.js now, so it is the one choice
+  // that works with nothing configured, and the picker offers it. The web
+  // keeps the remote engine: a server is what a browser tab has.
+  // `Platform["kind"]` cannot tell desktop Tauri (`cargo tauri dev`) from a
+  // phone, so desktop starts in-process too and switches in Settings.
+  assert.equal(defaultEngineIdFor("tauri"), ENGINE_PRAISONAI_TS);
+  assert.equal(defaultEngineIdFor("web"), ENGINE_REMOTE_HTTP);
+});
 
 test("a stop the engine REFUSED is announced", () => {
   // Discarding the controller's boolean made a refused Stop indistinguishable
@@ -41,8 +55,95 @@ import { createFakeShell, PHONE_INSETS } from "../../testing/src/fake-shell.ts";
 import { createFakeStorage } from "../../testing/src/fake-storage.ts";
 import { createFakeSecrets } from "../../testing/src/fake-secrets.ts";
 import { createFakeHttp, sseResponse, streamOf } from "../../testing/src/fake-http.ts";
-import { mount } from "./main.ts";
+import { PROTOCOL_VERSION } from "../../protocol/src/version.ts";
+import { appEngines, mount } from "./main.ts";
+import { ENGINE_PRAISONAI_TS, ENGINE_REMOTE_HTTP, SETTING_DEFS } from "./registry.ts";
+import { createSettingsStore, facadeFor, type SettingsFacade } from "../../core/src/settings/store.ts";
 import type { Platform } from "./platform.ts";
+
+test("the real composition root offers the in-process engine", async () => {
+  // The package's headline capability -- running the agent loop in-process is
+  // the reason praisonai-mobile exists -- and nothing asserted `main.ts` offers
+  // it. `enginesFor` only pushes it when `createInProcess` is supplied, and the
+  // composition root did not supply one, so the whole of engines/praisonai-ts/
+  // was unreachable from the application while its own suite stayed green
+  // (every test that exercises it constructs it directly).
+  const secrets = createFakeSecrets();
+  const store = createSettingsStore(SETTING_DEFS, createFakeStorage(), secrets);
+  await store.load();
+  const settings: SettingsFacade = facadeFor(store, secrets);
+  const persistence = {
+    async record() {
+      return { userIndex: 0, assistantIndex: 1, versions: 1, active: 0 };
+    },
+  };
+
+  const ids = appEngines({
+    settings,
+    http: createFakeHttp(),
+    persistence,
+    onIgnored: () => {},
+  }).map((c) => c.id);
+
+  assert.ok(ids.includes(ENGINE_PRAISONAI_TS), `only ${ids.join(", ")} on offer`);
+  // And the remote engine is still offered and first, so the default keeps
+  // working with nothing configured.
+  assert.equal(ids[0], ENGINE_REMOTE_HTTP, "the remote engine must stay the default");
+});
+
+test("the in-process engine, when its chunk cannot load, fails RECOVERABLY", async () => {
+  // The engine reaches praisonai through a lazily-fetched chunk, and a fetch
+  // can fail: a flaky connection, a build that left the engine out, a hashed
+  // file the page no longer matches. This used to be exercised by the module's
+  // ABSENCE from disk; with praisonai installed the real loader succeeds here
+  // (and would go to the network), so the failing loader is INJECTED, through
+  // the seam appEngines exposes for exactly this. Constructing the engine must
+  // still succeed (create() opens no upstream), and the failure must arrive as
+  // a single recoverable `error` event through engine.ts's run loop, never as
+  // an unhandled rejection that takes down the turn opaquely. That is the
+  // named, on-screen failure engines.ts argues for.
+  const secrets = createFakeSecrets();
+  const store = createSettingsStore(SETTING_DEFS, createFakeStorage(), secrets);
+  await store.load();
+  const settings: SettingsFacade = facadeFor(store, secrets);
+  const persistence = {
+    async record() {
+      return { userIndex: 0, assistantIndex: 1, versions: 1, active: 0 };
+    },
+  };
+
+  const inProcess = appEngines({
+    settings,
+    http: createFakeHttp(),
+    persistence,
+    onIgnored: () => {},
+    loadAgent: async () => {
+      throw new Error("chunk-XXXXXXXX.js: failed to fetch");
+    },
+  }).find((c) => c.id === ENGINE_PRAISONAI_TS);
+  assert.ok(inProcess, "the in-process engine must be on offer to be exercised");
+
+  // create() itself must not throw: it wires a factory, it does not load it.
+  const engine = await inProcess.create();
+  assert.equal(engine.id, ENGINE_PRAISONAI_TS);
+
+  const request = {
+    prompt: "hello",
+    chatId: "c1",
+    runId: "r1",
+    tools: false,
+    regenerateOf: null,
+    attachments: [],
+  };
+  const seen: string[] = [];
+  for await (const event of engine.run(request, new AbortController().signal)) {
+    seen.push(event.type);
+  }
+  await engine.dispose();
+
+  // start then a single error -- the recoverable, named terminal, not a crash.
+  assert.deepEqual(seen, ["start", "error"], `expected a recoverable failure, saw ${seen.join(", ")}`);
+});
 
 const nodeTime = () => ({
   nowMs: () => performance.now(),
@@ -647,4 +748,590 @@ test("the message field is labelled as the field, not as the button beside it", 
   assert.equal(box.getAttribute("aria-label"), en.composerLabel);
   assert.notEqual(box.getAttribute("aria-label"), en.actionSend, "not the button's name");
   app?.dispose();
+});
+
+// ---- an unreachable engine must not be a dead app ---------------------------
+
+test("the app STARTS when the engine is not answering, and says so", async () => {
+  // PR #4647 made the health probe a hard boot gate, and the whole app
+  // rendered "PraisonAI could not start: 404" -- 17 end-to-end tests went red
+  // on main, and on a phone with no desktop engine to reach the app simply
+  // would not open. The user cannot fix it either: the address is changed in
+  // Settings, and Settings is behind the app that will not start.
+  const { dom, platform } = harness(); // no /health route: the engine is unreachable
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  assert.notEqual(app, null, "an unreachable engine must not stop the app from starting");
+  assert.ok(dom.find((n) => n.tagName === "TEXTAREA"), "the composer must be there");
+  assert.ok(dom.find((n) => String(n.dataset["action"]) === "send"), "and the send control");
+
+  const notice = dom.find((n) => n.className.includes("row-notice"));
+  assert.ok(notice, `the app must SAY the engine is not answering:\n${dom.text()}`);
+  assert.equal(notice.dataset["tone"], "warning");
+
+  // Assertive, because the user is about to type into something that cannot
+  // reply yet -- waiting politely for the queue means they find out by sending.
+  const shouted = dom.all().find((n) => n.getAttribute("aria-live") === "assertive");
+  assert.match(String(shouted?.textContent), /not answering yet/);
+  app?.dispose();
+});
+
+test("a HEALTHY engine boots with no warning -- the pair", async () => {
+  // Without this, an app that always warned would pass the test above and cry
+  // wolf on every launch.
+  const { dom, http, platform } = harness();
+  http.on("/health", () => ({
+    status: 200,
+    headers: {},
+    body: streamOf(JSON.stringify({ ok: true, version: PROTOCOL_VERSION })),
+  }));
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  assert.notEqual(app, null);
+  assert.equal(
+    dom.find((n) => n.className.includes("row-notice")),
+    null,
+    "a healthy engine must not be reported as unhealthy",
+  );
+  app?.dispose();
+});
+
+test("a PERMANENT refusal still stops the app, with a name", async () => {
+  // The other half. A retryable unreadiness boots and warns; a protocol
+  // mismatch never resolves itself, so booting into it only defers the same
+  // failure to the user's first message. It must still be fatal.
+  //
+  // Version 1, not 99: a NEWER engine is deliberately accepted, because
+  // version.ts treats unknown fields as additive and refusing one would strand
+  // every shipped client on the day the engine ships first. Too OLD is the
+  // permanent refusal.
+  const { dom, http, platform } = harness();
+  http.on("/health", () => ({
+    status: 200,
+    headers: {},
+    body: streamOf(JSON.stringify({ ok: true, version: 1 })),
+  }));
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  assert.equal(app, null, "a version mismatch must refuse to boot");
+  assert.match(dom.text(), /could not start/, dom.text());
+  assert.match(dom.text(), /too_old|engine=1|protocol/, "and it must name the reason");
+});
+
+// ---- the modules the barrel used to gate (issue #4635) ----------------------
+//
+// Nine view models had 128 tests and zero non-test importers: settings, the
+// chat list, follow-the-stream, locale/direction and the composer were all
+// maintained, tested and unreachable from `main.ts`. These drive the real
+// `mount()` and assert each is now wired.
+
+test("tapping Settings paints the settings screen", async () => {
+  // The acceptance test named in the issue. `router.subscribe` had no non-test
+  // caller, so pushing the settings route rendered nothing: the tap painted a
+  // blank and the next back gesture was consumed instead of exiting.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  dom.click(dom.find((n) => n.dataset["route"] === "settings") as never);
+  await settle();
+
+  assert.ok(
+    dom.find((n) => n.className.includes("screen-settings")),
+    `Settings painted nothing:\n${dom.text()}`,
+  );
+  // And the chat screen is hidden, not left underneath.
+  const chat = dom.find((n) => n.className === "screen");
+  assert.equal(chat?.hidden, true, "the chat screen must be hidden while settings shows");
+  app?.dispose();
+});
+
+test("the settings screen is EDITABLE, so a phone can point the engine somewhere reachable", async () => {
+  // The recovery the remote-http default depends on. A phone reaches no
+  // `127.0.0.1:8765`, so first launch warns that the engine is not answering --
+  // and the only fix is to change `baseUrl`. That was impossible: every setting
+  // rendered as a read-only <span>, and `facade.set` / `validateInput` had no
+  // caller, so an unreachable engine had no way back. The row is a real field
+  // now; committing it must PERSIST -- createApp loads settings first and builds
+  // the engine from them, so the change takes effect on the next launch, which
+  // is the recovery this unblocks.
+  const storage = createFakeStorage();
+  const { dom, platform } = harness({ storage });
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  dom.click(dom.find((n) => n.dataset["route"] === "settings") as never);
+  await settle();
+
+  // The baseUrl row must carry an editable control, not a read-only span.
+  const field = dom.find(
+    (n) =>
+      (n.tagName === "INPUT" || n.tagName === "SELECT") &&
+      n.getAttribute("aria-label") === "Engine address",
+  );
+  assert.ok(field, `the engine address must be editable:\n${dom.text()}`);
+
+  (field as { value: string }).value = "http://10.0.0.7:9000";
+  dom.change(field as never);
+  await settle();
+
+  // Persisted in the live facade AND written through to storage, so the next
+  // launch's `settings.load()` reads the address the user set, not the default.
+  assert.equal(app?.settings.get("baseUrl"), "http://10.0.0.7:9000", "the edit must persist in the facade");
+  const raw = await storage.read({ namespace: "settings", id: "app" });
+  assert.ok(
+    raw !== null && raw.includes("10.0.0.7:9000"),
+    `the edit must survive a relaunch:\n${String(raw)}`,
+  );
+  app?.dispose();
+});
+
+test("a setting the store REFUSES resets the field instead of showing a phantom value", async () => {
+  // `set` returns false for a value the def rejects, and `validateInput`
+  // returns null for one that will not parse. Either way the field must fall
+  // back to what is actually stored -- a screen showing a value the store never
+  // accepted is a setting the user believes they changed and did not.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  dom.click(dom.find((n) => n.dataset["route"] === "settings") as never);
+  await settle();
+
+  // The engine choice is a closed set (`choices: [remote-http]`), so an unknown
+  // id must be refused and the select must snap back.
+  const select = dom.find(
+    (n) => n.tagName === "SELECT" && n.getAttribute("aria-label") === "Engine",
+  );
+  assert.ok(select, "the engine choice must be a select");
+  (select as { value: string }).value = "not-a-real-engine";
+  dom.change(select as never);
+  await settle();
+
+  assert.equal(app?.settings.get("engineId"), ENGINE_REMOTE_HTTP, "a rejected choice must not persist");
+  assert.equal((select as { value: string }).value, ENGINE_REMOTE_HTTP, "the field must reset to what is stored");
+  app?.dispose();
+});
+
+test("a storage failure while editing a setting stays LOCAL, not fatal", async () => {
+  // `commit` was a fire-and-forget `void commit(...)`, and `settings.set`
+  // persists through StoragePort -- which rejects on a real device
+  // (SecurityError with site data blocked, QuotaExceededError). Left to float,
+  // that rejection reached the global crash handler and replaced the WHOLE app
+  // with the fatal screen; worse, the store had already committed the value to
+  // memory before persisting, so the field showed an address the next launch
+  // would never read. A failed write must stay local: the app keeps working and
+  // the field resets to what is actually stored.
+  const storage = createFakeStorage();
+  const { dom, platform } = harness({ storage });
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  assert.notEqual(app, null);
+
+  dom.click(dom.find((n) => n.dataset["route"] === "settings") as never);
+  await settle();
+
+  const field = dom.find(
+    (n) =>
+      (n.tagName === "INPUT" || n.tagName === "SELECT") &&
+      n.getAttribute("aria-label") === "Engine address",
+  );
+  assert.ok(field, `the engine address must be editable:\n${dom.text()}`);
+
+  const before = app?.settings.get("baseUrl");
+  storage.failNext("QuotaExceededError: the storage is full");
+  (field as { value: string }).value = "http://10.0.0.7:9000";
+  dom.change(field as never);
+  await settle();
+
+  // The app must survive: the chat screen and composer are still reachable, and
+  // nothing escalated to the fatal "could not start" screen.
+  assert.ok(
+    dom.find((n) => n.tagName === "TEXTAREA" || n.tagName === "INPUT" || n.tagName === "SELECT"),
+    `a failed setting write must not take down the app:\n${dom.text()}`,
+  );
+  assert.equal(
+    /could not start/.test(dom.text()),
+    false,
+    "a failed settings write must not become the app-wide crash screen",
+  );
+
+  // The store rolled the value back, so the field shows what is actually
+  // stored -- not a phantom the next launch will not read.
+  assert.equal(app?.settings.get("baseUrl"), before, "a value that did not persist must not linger in memory");
+  assert.equal((field as { value: string }).value, String(before), "the field must reset to what is stored");
+  app?.dispose();
+});
+
+test("a route change MOVES focus to the new heading, and Back restores it", async () => {
+  // focus.ts computes where focus belongs on every route change and the app
+  // used to throw the answer away -- it read the target only to decide whether
+  // to announce, always as a "push", and never called `focus()`. So a
+  // keyboard or screen-reader user who opened Settings was left focused on the
+  // button they tapped (now on a hidden screen) or dropped to <body>, and Back
+  // never returned them to where they were.
+  // The fake shell is built directly, so `pressBack()` (a test-only driver, not
+  // part of ShellPort) is reachable to drive the OS back gesture.
+  const shell = createFakeShell(PHONE_INSETS);
+  const dom = createFakeDom();
+  const platform: Platform = {
+    shell, storage: createFakeStorage(), secrets: createFakeSecrets(),
+    http: createFakeHttp(), time: nodeTime(), kind: "web",
+  };
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  assert.notEqual(app, null);
+
+  const toSettings = dom.find((n) => n.dataset["route"] === "settings");
+  assert.ok(toSettings, "no settings button");
+  dom.click(toSettings as never);
+  await settle();
+
+  // Focus is on the settings screen's heading, not on the hidden chat screen.
+  const focused = dom.activeElement();
+  assert.equal(
+    focused?.dataset["focusId"],
+    "heading:settings",
+    `a route change must move focus to the new heading, landed on: ${
+      focused?.dataset["focusId"] ?? "<nothing>"
+    }`,
+  );
+
+  // Back pops the route -- and restores focus to the control that opened it,
+  // so the user lands where they were rather than at the top of the chat.
+  shell.pressBack();
+  await settle();
+  assert.equal(
+    dom.activeElement(),
+    toSettings,
+    "Back must restore focus to the control that opened the screen",
+  );
+  app?.dispose();
+});
+
+test("the chat list is painted from the session, and a chat reopens", async () => {
+  // `session.list()` had no app caller and the chat list no way to be reached,
+  // so a conversation, once left, could never be reopened. The chats route must
+  // render the stored chats -- from the SESSION, the thing that had no reader --
+  // and tapping one must reopen it.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  assert.notEqual(app, null);
+
+  // Store a conversation through the session directly. Persistence on a real
+  // turn is the in-process engine's job; the remote harness never records, so
+  // seed the session the list reads from. This is the object `list()` returns.
+  await app!.session.record("what is the capital of France", "Paris");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+
+  const list = dom.find((n) => n.className.includes("screen-chats"));
+  assert.ok(list, `the chat list painted nothing:\n${dom.text()}`);
+  const row = dom.find((n) => n.dataset["action"] === "open-chat");
+  assert.ok(row, `a stored conversation must be an openable row:\n${dom.text()}`);
+
+  // And opening it returns to the chat screen carrying that conversation.
+  dom.click(row as never);
+  await settle();
+  const chat = dom.find((n) => n.className === "screen");
+  assert.equal(chat?.hidden, false, "opening a chat must show the chat screen");
+  assert.match(dom.text(), /Paris/, "the reopened conversation must be painted");
+  app?.dispose();
+});
+
+test("a turn sent AFTER reopening a chat lands below the history, not above it", async () => {
+  // The reopened messages were appended as untracked <p> nodes while `render`
+  // was reset to empty, so the next turn reconciled from nothing and
+  // `applyOps` inserted its rows at index 0 -- ABOVE the restored history. The
+  // newest answer rendered above the older conversation, and the history sat
+  // outside `render` where no later reconcile could touch it. Painting the
+  // history THROUGH the reconciler keeps both turns in one coordinate system.
+  const { dom, http, platform } = harness();
+  http.on("/chat", () =>
+    sseResponse(
+      sse([
+        ["start", { msg_id: "m1", run_id: "r1" }],
+        ["delta", { msg_id: "m1", text: "the newest answer" }],
+        ["end", { msg_id: "m1", user_index: 2, assistant_index: 3, versions: 1, active: 0 }],
+      ]),
+    ),
+  );
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  assert.notEqual(app, null);
+
+  await app!.session.record("what is the capital of France", "Paris");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+  dom.click(dom.find((n) => n.dataset["action"] === "open-chat") as never);
+  await settle();
+
+  submit(dom, "and its population?");
+  await settle(120);
+
+  const transcript = dom.find((n) => n.className.includes("transcript"));
+  assert.ok(transcript, "no transcript");
+  const text = (transcript.children as { textContent: string }[]).map((c) => c.textContent).join(" | ");
+
+  // The restored history must survive the next turn -- it must not be wiped by
+  // a reconcile that never knew it existed.
+  assert.match(text, /capital of France/, `the user's original question was lost:\n${text}`);
+  assert.match(text, /Paris/, `the reopened answer was lost:\n${text}`);
+  assert.match(text, /the newest answer/, `the new turn did not render:\n${text}`);
+
+  // And order: the newest answer is LAST, below the history it followed.
+  const question = text.indexOf("capital of France");
+  const answer = text.indexOf("Paris");
+  const newest = text.indexOf("the newest answer");
+  assert.ok(
+    question < newest && answer < newest,
+    `the newest turn must render below the history, got order:\n${text}`,
+  );
+  app?.dispose();
+});
+
+test("a storage failure while the chat list loads stays LOCAL, not fatal", async () => {
+  // The list load was a floating `void (async ...)()` with no rejection
+  // handler. A StoragePort rejection -- SecurityError, QuotaExceeded -- reached
+  // the global crash handler and replaced the WHOLE app with the fatal screen,
+  // instead of showing a local error the user can back out of.
+  const { dom, storage, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  assert.notEqual(app, null, "the app must boot before the list is even asked for");
+
+  storage.failNext("SecurityError: the operation is insecure");
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+
+  // The chat screen and its composer must still be reachable: this was a local
+  // failure, not a boot failure.
+  assert.ok(dom.find((n) => n.tagName === "TEXTAREA"), `the app must survive a list failure:\n${dom.text()}`);
+  // And nothing must have escalated to the fatal "could not start" screen.
+  assert.equal(
+    /could not start/.test(dom.text()),
+    false,
+    "a failed chat list must not become the app-wide crash screen",
+  );
+  app?.dispose();
+});
+
+test("the composer field mirrors the composer view model", async () => {
+  // The raw <textarea> is backed by composer.ts now: typing updates the draft
+  // and enables Send, an empty field disables it. Draft persistence, the
+  // Enter policy and autosize all live in that one state.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  const box = dom.find((n) => n.tagName === "TEXTAREA") as never;
+  const send = () => dom.find((n) => n.dataset["action"] === "send") as never;
+  assert.equal((send() as { disabled: boolean }).disabled, true, "Send is disabled on an empty draft");
+
+  (box as { value: string }).value = "a question";
+  (box as { dispatch(t: string, e: unknown): void }).dispatch("input", {});
+  assert.equal((send() as { disabled: boolean }).disabled, false, "typing must enable Send");
+  app?.dispose();
+});
+
+test("the locale and direction are detected, not hardcoded to en", async () => {
+  // main.ts:173 passed `locale: "en"` as a literal, so every RTL user got an
+  // LTR layout and the #4607 direction fix was unreachable. An Arabic device
+  // must lay out right-to-left.
+  const { dom, platform } = harness();
+  const app = await mount({
+    root: dom.root as never,
+    platform,
+    now: () => 1,
+    newChatId: () => "c1",
+    locales: ["ar-EG"],
+  });
+
+  assert.equal(dom.root.getAttribute("dir"), "rtl", "an Arabic locale must lay out RTL");
+  app?.dispose();
+});
+
+test("an English device still lays out left-to-right -- the pair", async () => {
+  const { dom, platform } = harness();
+  const app = await mount({
+    root: dom.root as never,
+    platform,
+    now: () => 1,
+    newChatId: () => "c1",
+    locales: ["en-GB"],
+  });
+
+  assert.equal(dom.root.getAttribute("dir"), "ltr");
+  app?.dispose();
+});
+
+// ---- the recovery path, end to end -----------------------------------------
+//
+// A phone reaches no `127.0.0.1:8765`, so first launch warns that the engine
+// is not answering and points at Settings. Everything from that warning to a
+// working engine has to hold, and two links of it did not: a refused value
+// vanished with no explanation, and a corrected address changed nothing until
+// the app was force-quit and relaunched.
+
+const settingField = (dom: ReturnType<typeof createFakeDom>, label: string) =>
+  dom.find(
+    (n) => (n.tagName === "INPUT" || n.tagName === "SELECT") && n.getAttribute("aria-label") === label,
+  );
+
+const openSettings = async (dom: ReturnType<typeof createFakeDom>): Promise<void> => {
+  dom.click(dom.find((n) => n.dataset["route"] === "settings") as never);
+  await settle();
+};
+
+test("a corrected engine address redirects the very NEXT message, with no relaunch", async () => {
+  // The whole point of making the screen editable. `enginesFor` read `baseUrl`
+  // once at construction and the app builds its engine once at boot, so the
+  // address the user typed was persisted, displayed, and then ignored for the
+  // rest of the session -- every message still went to the unreachable default.
+  const { dom, http, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  assert.notEqual(app, null);
+
+  await openSettings(dom);
+  const field = settingField(dom, "Engine address");
+  assert.ok(field, `the engine address must be editable:\n${dom.text()}`);
+  field.value = "http://10.0.0.7:9000";
+  dom.change(field as never);
+  await settle();
+
+  submit(dom, "hello");
+  await settle();
+
+  const chats = http.sent.filter((r) => r.url.endsWith("/chat")).map((r) => r.url);
+  assert.ok(chats.length > 0, "the message never reached the transport at all");
+  assert.equal(
+    chats.at(-1),
+    "http://10.0.0.7:9000/chat",
+    `the turn still went to the old address: ${chats.join(", ")}`,
+  );
+  app?.dispose();
+});
+
+test("a REFUSED setting says so on screen, instead of the field quietly snapping back", async () => {
+  // A field that resets and says nothing is indistinguishable from a mis-tap,
+  // a lost keystroke, or a save that worked. On the one screen whose job is to
+  // repair an unreachable engine, "nothing happened and nothing was said" is
+  // the failure mode that leaves a user re-typing the same rejected value.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  await openSettings(dom);
+  const select = settingField(dom, "Engine");
+  assert.ok(select, "the engine choice must be a select");
+  select.value = "not-a-real-engine";
+  dom.change(select as never);
+  await settle();
+
+  // Still refused, and still snapped back -- the existing guarantees.
+  assert.equal(app?.settings.get("engineId"), ENGINE_REMOTE_HTTP, "a rejected choice must not persist");
+  assert.equal(select.value, ENGINE_REMOTE_HTTP, "the field must reset to what is stored");
+
+  // And now SAID. Visibly, for a sighted user...
+  const shown = dom.find((n) => n.className.includes("setting-error") && n.hidden === false);
+  assert.ok(shown, `a refused setting was dropped silently:\n${dom.text()}`);
+  assert.match(shown.textContent, /Engine/, "the message must name the setting it refused");
+
+  // ...and out loud, because the field it belongs to may be off screen and a
+  // screen-reader user gets no "it snapped back" cue at all.
+  const spoken = dom.find((n) => n.getAttribute("aria-live") === "assertive");
+  assert.match(spoken?.textContent ?? "", /Engine/, "a refused setting must also be announced");
+  app?.dispose();
+});
+
+test("an ACCEPTED setting clears its OWN refusal, and only its own", async () => {
+  // Two pairs in one, because each guards the other's cheap implementation. A
+  // screen that reports every write as refused would satisfy the test above
+  // while making the setting look permanently broken, so an accepted write has
+  // to clear its message. And clearing ALL of them on any accepted write would
+  // wipe a refusal the user has not read off a DIFFERENT setting -- the note
+  // beside `engineId` is still true while `baseUrl` is being edited.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  const errorFor = (key: string) =>
+    dom.find((n) => n.dataset["settingError"] === key && n.hidden === false);
+
+  await openSettings(dom);
+  const select = settingField(dom, "Engine");
+  assert.ok(select);
+  select.value = "not-a-real-engine";
+  dom.change(select as never);
+  await settle();
+  assert.ok(errorFor("engineId"), "the refusal this test clears must be on screen first");
+
+  // An accepted write to a DIFFERENT setting leaves it alone.
+  const field = settingField(dom, "Engine address");
+  assert.ok(field);
+  field.value = "http://10.0.0.7:9000";
+  dom.change(field as never);
+  await settle();
+  assert.equal(app?.settings.get("baseUrl"), "http://10.0.0.7:9000", "the accepted edit must persist");
+  assert.equal(errorFor("baseUrl"), null, "an accepted write must not accuse itself");
+  assert.ok(errorFor("engineId"), "a refusal must not be cleared by a write to another setting");
+
+  // An accepted write to the SAME setting does clear it.
+  select.value = ENGINE_REMOTE_HTTP;
+  dom.change(select as never);
+  await settle();
+  assert.equal(app?.settings.get("engineId"), ENGINE_REMOTE_HTTP);
+  assert.equal(
+    errorFor("engineId"),
+    null,
+    `an accepted write must leave no refusal on its own field:\n${dom.text()}`,
+  );
+  app?.dispose();
+});
+
+test("on a device with nothing configured, the first message reaches the in-process Agent", async () => {
+  // The whole wiring, end to end, from the real composition root: platform
+  // kind "tauri", empty storage, no engine picked -- so `defaultEngineIdFor`
+  // decides -- and a message typed into the real composer. It must arrive at
+  // praisonai's `Agent`, and the answer must come back through the real
+  // engine, controller and transcript onto the screen. No network and no
+  // key: the Agent class is a scripted one handed in through the seam
+  // `appEngines` exposes for it, the way praisonai-ts's own engine tests
+  // script theirs. Every other piece is the shipping one.
+  const prompts: string[] = [];
+  const configs: { instructions: string; llm?: string }[] = [];
+  class ScriptedAgent {
+    lastStopReason: "completed" | null = "completed";
+    constructor(config: { instructions: string; llm?: string }) {
+      configs.push(config);
+    }
+    async *streamEvents(prompt: string) {
+      prompts.push(prompt);
+      yield { type: "text", delta: "The capital of France is Paris." } as const;
+      yield { type: "finish", text: "The capital of France is Paris." } as const;
+    }
+  }
+
+  const { dom, http, platform: web } = harness();
+  http.on("/chat", () => {
+    throw new Error("the remote engine must not be contacted on a device");
+  });
+  const platform: Platform = { ...web, kind: "tauri" };
+  const app = await mount({
+    root: dom.root as never,
+    platform,
+    now: () => 1,
+    newChatId: () => "c1",
+    loadAgent: async () => ScriptedAgent,
+  });
+  assert.ok(app, "the app must mount");
+  assert.equal(app.engine.id, ENGINE_PRAISONAI_TS, "with nothing configured, a device runs in-process");
+  assert.equal(
+    app.settings.get("engineId"),
+    ENGINE_PRAISONAI_TS,
+    "and Settings shows the same engine -- main.ts must hand boot the platform's defs, not the web's",
+  );
+
+  submit(dom, "capital of france?");
+  await settle(120);
+
+  assert.deepEqual(prompts, ["capital of france?"], "the typed message must reach the Agent verbatim");
+  assert.equal(configs.length, 1, "one Agent, built on the first turn -- not at boot");
+  assert.equal(configs[0]?.llm, "gpt-4o-mini", "with the model the settings default to");
+  const answer = dom.find((n) => n.textContent.includes("Paris") && n.className.includes("row"));
+  assert.ok(answer, "the Agent's answer must reach the transcript");
+  assert.equal(dom.find((n) => n.className.includes("row-error")), null, "and nothing must fail on the way");
+  await app.dispose();
 });

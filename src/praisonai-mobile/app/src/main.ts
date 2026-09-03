@@ -15,16 +15,131 @@
  */
 import { createApp, type App } from "./boot.ts";
 import { detectPlatform, type Platform } from "./platform.ts";
-import { enginesFor, OPENAI_KEY, SETTING_DEFS } from "./registry.ts";
+import { enginesFor, defaultEngineIdFor, settingDefsFor } from "./registry.ts";
 import { intentFrom, type Actionable, type Intent } from "./intents.ts";
 import { applyOps, emptyNodes, type RowNodes } from "./dom.ts";
 import { installCrashHandler } from "./crash.ts";
 import { emptyRender, reconcile, type RenderState } from "../../ui/src/render/reconcile.ts";
-import { buildTranscript } from "../../ui/src/transcript/view-model.ts";
+import { buildTranscript, type Row } from "../../ui/src/transcript/view-model.ts";
 import type { RunView } from "../../core/src/run/controller.ts";
 import type { Route } from "../../ui/src/router.ts";
 import { en, type Strings } from "../../ui/src/i18n/strings.ts";
 import { announce, initialAnnouncer, type AnnouncerState } from "../../ui/src/a11y/announce.ts";
+import { createScreens } from "./mount.ts";
+import { transition, screenFor, type ScreenId } from "../../ui/src/screens.ts";
+import { routeTitle, chatRowName } from "../../ui/src/a11y/names.ts";
+import {
+  focusForRoute,
+  headingId,
+  screenAnnouncement,
+  type FocusTarget,
+  type Navigation,
+} from "../../ui/src/a11y/focus.ts";
+import { buildSettings, labelOf, validateInput, type ValueRow } from "../../ui/src/settings/view-model.ts";
+import { buildChatList } from "../../ui/src/chats/list-view-model.ts";
+import type { ChatSummary, StoredMessage } from "../../core/src/chat/repository.ts";
+import { createBundle } from "../../ui/src/i18n/bundle.ts";
+import { resolveLocale, logicalInsets } from "../../ui/src/i18n/locale.ts";
+import { geometryOf, initialLayout, withInsets, withKeyboard } from "../../ui/src/layout/insets.ts";
+import {
+  emptyComposer,
+  setDraft,
+  submit as submitComposer,
+  keyAction,
+  heightFor,
+  lineCountOf,
+  draftOf,
+  type ComposerState,
+} from "../../ui/src/composer/composer.ts";
+import {
+  initialFollow,
+  onContentChanged,
+  onScroll,
+  jumpToLatest,
+  shouldShowJumpToLatest,
+  type FollowState,
+  type ScrollMetrics,
+} from "../../ui/src/transcript/scroll.ts";
+import type { EngineChoice } from "./engines.ts";
+import type { AgentEnginePort } from "../../core/src/ports/agent-engine.ts";
+import { createPraisonTsEngine, type RunPersistence } from "../../engines/src/praisonai-ts/engine.ts";
+import { loadPraisonAgent, type PraisonAgentModule } from "../../engines/src/praisonai-ts/load-agent.ts";
+import type { PraisonAgent } from "../../engines/src/praisonai-ts/agent-api.ts";
+import type { SettingDef, SettingsFacade } from "../../core/src/settings/store.ts";
+import type { IgnoredReason } from "../../protocol/src/decode.ts";
+import type { HttpPort } from "../../core/src/ports/http.ts";
+
+/**
+ * The in-process praisonai-ts engine, built lazily.
+ *
+ * `praisonai` is a dependency now, and it reaches the webview as a CHUNK: the
+ * literal `import("praisonai/mobile")` in engines/praisonai-ts/load-agent.ts
+ * is what lets esbuild split it out, so the shell that loads at first paint
+ * stays at 66kB and the engine's ~1.3MB is fetched only when this factory
+ * first runs. It used to be a runtime-computed specifier that kept `praisonai`
+ * out of both tsc's and esbuild's graphs entirely -- necessary while its Agent
+ * graph imported `crypto` and `events` statically (#4437), and the reason the
+ * engine's module was simply ABSENT from every shipped build. `praisonai/mobile`
+ * is the upstream entry without those imports; `tools/bundle.mjs` is what
+ * proves that on every build.
+ *
+ * The engine takes a `createAgent` factory, not an agent: the model comes from
+ * settings, which can change between turns.
+ */
+async function createInProcessEngine(
+  persistence: RunPersistence,
+  settings: SettingsFacade,
+  loadAgent: () => Promise<PraisonAgentModule>,
+): Promise<AgentEnginePort> {
+  const settingString = (key: string, fallback: string): string => {
+    const value = settings.get(key);
+    return typeof value === "string" && value !== "" ? value : fallback;
+  };
+  return createPraisonTsEngine({
+    persistence,
+    createAgent: async (): Promise<PraisonAgent> => {
+      // The chunk is fetched here, on the first turn, not at create(): a
+      // fetch that fails then surfaces through engine.ts's run loop as a
+      // recoverable `error` event rather than as a factory that throws.
+      const Agent = await loadAgent();
+      return new Agent({
+        instructions: "You are a helpful assistant.",
+        llm: settingString("model", "gpt-4o-mini"),
+      });
+    },
+    newMsgId: () => globalThis.crypto.randomUUID(),
+  });
+}
+
+/**
+ * The engines the shipping composition root offers, in picker order.
+ *
+ * Extracted and exported so a test asserts the in-process engine is on offer
+ * rather than that a factory literal appears in `mount` -- the house rule this
+ * package keeps by. Running the agent loop in-process is the reason
+ * praisonai-mobile exists, and until `main.ts` supplied `createInProcess` the
+ * whole of `engines/src/praisonai-ts/` was unreachable from the application.
+ */
+export function appEngines(deps: {
+  readonly settings: SettingsFacade;
+  readonly http: HttpPort;
+  readonly persistence: RunPersistence;
+  readonly onIgnored: (reason: IgnoredReason, detail: string) => void;
+  /** How the in-process engine's `Agent` class is fetched. Defaults to the
+   *  real chunk loader. A test injects a rejecting one to drive the failure
+   *  path, because with `praisonai` installed the real one simply succeeds. */
+  readonly loadAgent?: () => Promise<PraisonAgentModule>;
+}): readonly EngineChoice[] {
+  const loadAgent = deps.loadAgent ?? loadPraisonAgent;
+  return enginesFor({
+    settings: deps.settings,
+    http: deps.http,
+    persistence: deps.persistence,
+    onIgnored: deps.onIgnored,
+    createInProcess: (persistence) => createInProcessEngine(persistence, deps.settings, loadAgent),
+  });
+}
+
 
 export interface MountDeps {
   readonly root: HTMLElement;
@@ -32,6 +147,228 @@ export interface MountDeps {
   readonly strings?: Strings;
   readonly now?: () => number;
   readonly newChatId?: () => string;
+  /** The locales the user prefers, most-preferred first. Injected so a test is
+   *  deterministic; defaults to the host's `navigator.languages`. */
+  readonly locales?: readonly string[];
+  /** How the in-process engine's `Agent` class is fetched. Defaults to the
+   *  real chunk loader; a test hands in a scripted class so a first message
+   *  can be driven into the in-process engine with no network and no key. */
+  readonly loadAgent?: () => Promise<PraisonAgentModule>;
+}
+
+/**
+ * The locale to lay the app out in.
+ *
+ * `main.ts` used to pass `locale: "en"` as a literal, so every RTL user got an
+ * LTR layout and the direction logic in ui/src/i18n/locale.ts was unreachable.
+ * The English table is the only translation that ships today, so `resolveLocale`
+ * matches the user's request against `["en"]` and falls back to English -- but
+ * `createBundle` still derives `direction` from the *requested* tag, so an
+ * Arabic device lays out right-to-left even while it reads English words. That
+ * is the honest state until more tables exist, and it is what makes the #4607
+ * fix reachable.
+ */
+export function requestedLocales(deps: MountDeps): readonly string[] {
+  if (deps.locales !== undefined) return deps.locales;
+  const nav = (globalThis as { navigator?: { languages?: readonly string[]; language?: string } })
+    .navigator;
+  if (nav === undefined) return ["en"];
+  if (Array.isArray(nav.languages) && nav.languages.length > 0) return nav.languages;
+  return [nav.language ?? "en"];
+}
+
+/** A screen's focusable heading, carrying `tabindex="-1"` so focus.ts can move
+ *  focus to it on a route change (a heading is not focusable otherwise). */
+function screenHeading(doc: Document, route: Route, strings: Strings): HTMLElement {
+  const heading = doc.createElement("h2");
+  heading.className = "screen-heading";
+  heading.setAttribute("tabindex", "-1");
+  heading.dataset["focusId"] = headingId(route);
+  heading.textContent = routeTitle(strings, route);
+  return heading;
+}
+
+/**
+ * The editable control for one value row. MARKUP ONLY -- no listener.
+ *
+ * A `choice` renders a `<select>`, everything else a `<textarea>`-free
+ * `<input>`, and the kind comes from `row.control` (the def), never from the
+ * value: view-model.ts rule 4 -- one bad write to a hand-edited settings file
+ * would otherwise turn a picker into a text box and the setting could never be
+ * changed back.
+ *
+ * The control carries `data-action="set-setting"` and its key, and does
+ * nothing else. Committing it used to happen inside a `change` listener
+ * attached right here, which made settings the ONE affordance in the app that
+ * did not go through `intents.ts` -- so the decision (which key, what was
+ * typed, and whether a refusal is worth saying anything about) could only be
+ * reached by synthesising events against a DOM, and the refusal path ended in
+ * a field that silently snapped back. Delegated on root like every tap, the
+ * decision is `intentFrom`'s and the write is `perform`'s, next to the live
+ * region that has to announce it.
+ *
+ * This is the recovery path the remote-http default depends on: a phone
+ * reaches no `127.0.0.1:8765`, and `baseUrl` could be READ on the settings
+ * screen but not CHANGED, so a first launch that could not reach the engine
+ * had no way to point it at one.
+ */
+function settingControl(doc: Document, def: SettingDef, row: ValueRow, settings: SettingsFacade): HTMLElement {
+  let control: HTMLElement & { value: string };
+  if (row.control === "choice" && row.choices !== null) {
+    const select = doc.createElement("select") as HTMLElement & { value: string };
+    for (const choice of row.choices) {
+      const option = doc.createElement("option") as HTMLElement & { value: string };
+      option.value = String(choice);
+      option.textContent = String(choice);
+      select.append(option);
+    }
+    control = select;
+  } else {
+    const input = doc.createElement("input") as HTMLElement & { value: string; type: string };
+    input.type = row.control === "number" ? "number" : "text";
+    control = input;
+  }
+  // From the STORE, not from `row.value`: identical today, and it stays
+  // identical only while nothing repaints a row from a stale view.
+  control.value = String(settings.get(def.key) ?? def.default);
+  control.className = "setting-value setting-input";
+  control.setAttribute("aria-label", row.label);
+  // `change`, not `input`: a field commits on blur or Enter, so a half-typed
+  // address is never stored and `set` is not called once per keystroke.
+  // Delegated on root -- `change` bubbles.
+  control.dataset["action"] = "set-setting";
+  control.dataset["settingKey"] = def.key;
+  return control;
+}
+
+/**
+ * Where a refusal for one setting is written, and nothing until there is one.
+ *
+ * `role="alert"` and empty: an alert region that is created at the moment of
+ * the failure is announced unreliably, so it exists from first paint and only
+ * its text changes. `hidden` while empty, because an empty bordered box beside
+ * a field reads as a rendering fault.
+ */
+function settingError(doc: Document, key: string): HTMLElement {
+  const note = doc.createElement("p");
+  note.className = "setting-error";
+  note.dataset["settingError"] = key;
+  note.setAttribute("role", "alert");
+  note.hidden = true;
+  return note;
+}
+
+/**
+ * The settings screen, built from the live registry via `buildSettings`.
+ *
+ * Data-driven, so a setting added to the registry appears here without a code
+ * change -- the whole reason settings/view-model.ts renders from `facade.defs()`
+ * rather than a hard-coded list. `value` rows are EDITABLE: a phone has no
+ * engine to reach at `127.0.0.1:8765`, and the only recovery for the remote
+ * default is to change `baseUrl` here -- which was impossible while every row
+ * rendered as a read-only `<span>`. Secret rows stay presence-only (the facade
+ * has no getter for a secret, by design).
+ */
+export function buildSettingsScreen(
+  doc: Document,
+  settings: SettingsFacade,
+  strings: Strings,
+): HTMLElement {
+  const section = doc.createElement("section");
+  section.className = "screen screen-settings";
+  section.append(screenHeading(doc, { name: "settings" }, strings));
+
+  const defByKey = new Map(settings.defs().map((def) => [def.key, def]));
+
+  const view = buildSettings(settings);
+  for (const warning of view.warnings) {
+    const note = doc.createElement("p");
+    note.className = "row row-notice";
+    note.dataset["tone"] = "warning";
+    note.textContent = warning.text;
+    section.append(note);
+  }
+  for (const group of view.sections) {
+    const title = doc.createElement("h3");
+    title.className = "settings-section";
+    title.textContent = group.title;
+    section.append(title);
+    for (const row of group.rows) {
+      const el = doc.createElement("div");
+      el.className = `row row-setting row-setting-${row.kind}`;
+      el.dataset["settingKey"] = row.key;
+      const label = doc.createElement("span");
+      label.className = "setting-label";
+      label.textContent = row.label;
+      el.append(label);
+      const def = row.kind === "value" ? defByKey.get(row.key) : undefined;
+      if (row.kind === "value" && def !== undefined) {
+        // The field and the place its refusal is written, together. The alert
+        // node ships empty and hidden rather than being created on the failure
+        // -- an alert region inserted at the moment it has something to say is
+        // announced unreliably by every screen reader.
+        el.append(settingControl(doc, def, row, settings), settingError(doc, row.key));
+      } else {
+        const value = doc.createElement("span");
+        value.className = "setting-value";
+        value.textContent = row.kind === "secret" ? row.presence : String(row.value);
+        el.append(value);
+      }
+      section.append(el);
+    }
+  }
+  return section;
+}
+
+/**
+ * The chat list, built from `session.list()` and `listUnreadable()`.
+ *
+ * Both lists, deliberately: a chat that failed to parse is a row here rather
+ * than a conversation that silently vanished -- the promise list-view-model.ts
+ * and repository.ts make together, and which only a renderer of the second list
+ * can keep.
+ */
+export function buildChatsScreen(
+  doc: Document,
+  summaries: readonly ChatSummary[],
+  unreadableIds: readonly string[],
+  nowMs: number,
+  strings: Strings,
+): HTMLElement {
+  const section = doc.createElement("section");
+  section.className = "screen screen-chats";
+  section.append(screenHeading(doc, { name: "chats" }, strings));
+
+  const view = buildChatList(summaries, unreadableIds, nowMs);
+  if (view.state === "none") {
+    const empty = doc.createElement("p");
+    empty.className = "empty";
+    empty.textContent = strings.chatsEmpty;
+    section.append(empty);
+    return section;
+  }
+  if (view.state === "all-unreadable") {
+    const note = doc.createElement("p");
+    note.className = "row row-notice";
+    note.dataset["tone"] = "warning";
+    note.textContent = strings.chatsAllUnreadable(view.unreadableCount);
+    section.append(note);
+  }
+  for (const row of view.rows) {
+    const el = doc.createElement("button");
+    el.type = "button";
+    el.className = `row row-chat row-chat-${row.kind}`;
+    // A tap on an unreadable row has nowhere useful to go, so only real chats
+    // carry the open-chat intent -- intents.ts refuses a missing chatId anyway.
+    if (row.kind === "chat") {
+      el.dataset["action"] = "open-chat";
+      el.dataset["chatId"] = row.id;
+    }
+    el.setAttribute("aria-label", chatRowName(strings, row));
+    el.textContent = row.title;
+    section.append(el);
+  }
+  return section;
 }
 
 /** A crash-screen renderer. Text only, and no dependency on anything that may
@@ -60,6 +397,28 @@ function renderFatal(root: HTMLElement, message: string): void {
  */
 export function stopNotice(stopped: boolean, strings: Strings): string | null {
   return stopped ? null : strings.stopRefused;
+}
+
+/**
+ * A reopened conversation's stored messages, as reconciler rows.
+ *
+ * Built as real `Row`s -- not raw `<p>` nodes -- so the transcript that history
+ * paints into is the SAME render state the next turn's stream appends to. The
+ * defect this replaces reset `render` to empty and appended untracked nodes, so
+ * the next turn reconciled from nothing and inserted its rows above the history.
+ *
+ * Ids carry a `history:` prefix and the message index, so they are stable
+ * (a re-open paints the same rows, not duplicates) and cannot collide with a
+ * live turn's `text:N` ids -- a collision would make the first streamed
+ * paragraph update a history row in place instead of appending after it.
+ */
+export function historyRows(messages: readonly StoredMessage[]): readonly Row[] {
+  return messages.map((message, index) => ({
+    kind: "text",
+    id: `history:${index}:${message.role}`,
+    text: message.content,
+    streaming: false,
+  }));
 }
 
 /** `createApp`, with a thrown failure turned into the same typed result the
@@ -96,13 +455,36 @@ export async function mount(deps: MountDeps): Promise<App | null> {
 
   const platform = deps.platform ?? detectPlatform();
 
+  // ---- locale and direction ----------------------------------------------
+  // Detected, not the literal "en" this used to hardcode. The English table is
+  // the only one that ships, so `resolveLocale` falls back to it -- but the
+  // bundle's direction comes from the REQUESTED tag, so an Arabic device lays
+  // out right-to-left, which is what makes the #4607 direction fix reachable.
+  const requested = requestedLocales(deps);
+  // The tag the string table is for: matched against what actually ships, so an
+  // "en-GB" request lands on "en" instead of a blank screen.
+  const activeLocale = resolveLocale(requested, ["en"], "en");
+  // Direction from the tag the USER asked for, not the resolved one: an Arabic
+  // device reading English words still lays out right-to-left.
+  const bundle = createBundle(requested[0] ?? "en", {}, "silent");
+  root.setAttribute("dir", bundle.direction);
+
   // ---- the frame the app paints into -------------------------------------
   const screen = doc.createElement("div");
   screen.className = "screen";
+  screen.dataset["screen"] = "chat";
 
   const bar = doc.createElement("header");
   bar.className = "topbar";
   const title = doc.createElement("h1");
+  title.className = "screen-heading";
+  title.setAttribute("tabindex", "-1");
+  title.dataset["focusId"] = headingId({ name: "chat", chatId: "" });
+  const toChats = doc.createElement("button");
+  toChats.type = "button";
+  toChats.dataset["action"] = "navigate";
+  toChats.dataset["route"] = "chats";
+  toChats.textContent = strings.routeChats;
   title.textContent = strings.appName;
   const newChat = doc.createElement("button");
   newChat.type = "button";
@@ -113,7 +495,7 @@ export async function mount(deps: MountDeps): Promise<App | null> {
   toSettings.dataset["action"] = "navigate";
   toSettings.dataset["route"] = "settings";
   toSettings.textContent = strings.routeSettings;
-  bar.append(title, newChat, toSettings);
+  bar.append(title, toChats, newChat, toSettings);
 
   const transcript = doc.createElement("main");
   transcript.className = "transcript";
@@ -150,7 +532,16 @@ export async function mount(deps: MountDeps): Promise<App | null> {
   sendButton.textContent = strings.actionSend;
   composer.append(input, sendButton);
 
-  screen.append(bar, transcript, composer, polite, assertive);
+  // Shown only when the user has scrolled up off the bottom of a streaming
+  // transcript -- `scroll.ts` owns that decision, this is its affordance.
+  const jumpLatest = doc.createElement("button");
+  jumpLatest.type = "button";
+  jumpLatest.className = "jump-latest";
+  jumpLatest.dataset["action"] = "jump-latest";
+  jumpLatest.textContent = strings.streaming;
+  jumpLatest.hidden = true;
+
+  screen.append(bar, transcript, jumpLatest, composer, polite, assertive);
   root.textContent = "";
   root.append(screen);
 
@@ -159,9 +550,45 @@ export async function mount(deps: MountDeps): Promise<App | null> {
   const nodes: RowNodes = emptyNodes();
   let announcer: AnnouncerState = initialAnnouncer;
 
+  // A reopened conversation's stored messages, as reconciler rows. The
+  // controller only ever publishes the CURRENT turn -- it resets to
+  // `initialTurn` on each run -- so history is not in the RunView. It is held
+  // here and PREPENDED to every reconcile, so a follow-up turn's rows land
+  // below it and a reconcile never emits `remove` for history it did not know
+  // about. Empty for a fresh chat; cleared on New chat.
+  let history: readonly Row[] = [];
+
+  // ---- composer state (draft, key policy, autosize) ----------------------
+  // The composer is data now, not just a <textarea>: a draft that survives a
+  // trip to settings, an Enter-vs-Shift-Enter policy, and a clamped height. The
+  // field mirrors this state; this state is the source of truth.
+  let composerState: ComposerState = emptyComposer();
+  const syncComposer = (): void => {
+    const text = draftOf(composerState);
+    if (input.value !== text) input.value = text;
+    input.style.setProperty("height", `${heightFor(lineCountOf(text))}px`);
+    sendButton.disabled = text.trim() === "";
+  };
+
+  // ---- follow-the-stream (scroll.ts) -------------------------------------
+  let follow: FollowState = initialFollow;
+  const metricsOf = (): ScrollMetrics => ({
+    scrollTop: transcript.scrollTop,
+    scrollHeight: transcript.scrollHeight,
+    clientHeight: transcript.clientHeight,
+  });
+  const applyFollow = (): void => {
+    jumpLatest.hidden = !shouldShowJumpToLatest(follow);
+  };
+
   const publish = (view: RunView): void => {
     const built = buildTranscript(view.turn, view.approvals);
-    const diff = reconcile(render, built.rows);
+    // History first, then the live turn. `history` is empty for a fresh chat,
+    // so this is a no-op there; for a reopened chat it keeps the restored
+    // conversation ABOVE the turn now streaming and inside the render state, so
+    // the diff updates the live rows without removing the history.
+    const rows = history.length === 0 ? built.rows : [...history, ...built.rows];
+    const diff = reconcile(render, rows);
     applyOps(transcript, nodes, diff.ops, strings);
     render = diff.next;
 
@@ -170,7 +597,7 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     const spoken = announce(announcer, {
       turn: view.turn,
       strings,
-      locale: "en",
+      locale: activeLocale,
       nowMs: Date.now(),
     });
     announcer = spoken.state;
@@ -189,8 +616,19 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     if (polites.length > 0) polite.textContent = polites.map((a) => a.text).join(" ");
     if (assertives.length > 0) assertive.textContent = assertives.map((a) => a.text).join(" ");
 
-    sendButton.textContent = view.turn.phase === "streaming" ? strings.actionStop : strings.actionSend;
-    sendButton.dataset["action"] = view.turn.phase === "streaming" ? "stop" : "send";
+    const streaming = view.turn.phase === "streaming";
+    sendButton.textContent = streaming ? strings.actionStop : strings.actionSend;
+    sendButton.dataset["action"] = streaming ? "stop" : "send";
+    // Stop is always tappable; Send is disabled on an empty draft. Guarding the
+    // disable on the action keeps a streaming Stop from going dead because the
+    // draft happens to be empty.
+    sendButton.disabled = streaming ? false : draftOf(composerState).trim() === "";
+
+    // New content asks to be scrolled to; whether it IS depends on scroll.ts.
+    const outcome = onContentChanged(follow, metricsOf());
+    follow = outcome.state;
+    if (outcome.action.kind === "scrollTo") transcript.scrollTop = outcome.action.top;
+    applyFollow();
   };
 
   // `createApp` returns a typed BootResult for the failures it anticipated --
@@ -217,11 +655,23 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     // the engine at boot and never replaced -- so the engine address the user
     // set was read, stored, and thrown away in favour of the hardcoded default.
     engines: (persistence, settings, onIgnored) =>
-      enginesFor({ settings, http: platform.http, persistence, onIgnored }),
-    settingDefs: SETTING_DEFS,
-    // The default when settings name none. createApp prefers the persisted
-    // `engineId` over this; passing it as a literal was ignoring the setting.
-    engineId: "remote-http",
+      appEngines({
+        settings,
+        http: platform.http,
+        persistence,
+        onIgnored,
+        ...(deps.loadAgent === undefined ? {} : { loadAgent: deps.loadAgent }),
+      }),
+    // The platform's defs, so the engine Settings shows as the default and the
+    // engine that answers a first launch are the same one.
+    settingDefs: settingDefsFor(platform.kind),
+    // The default when settings name none, chosen by platform: the in-process
+    // engine on a device (a phone has no `127.0.0.1:8765` to reach, and a
+    // cleartext localhost address is refused by iOS ATS and Android), the
+    // remote engine on the web where a server is what there is. createApp
+    // prefers the persisted `engineId` over this, so it only decides the
+    // first launch. registry.ts says why desktop Tauri counts as a device.
+    engineId: defaultEngineIdFor(platform.kind),
     onPublish: publish,
     now: deps.now ?? (() => Date.now()),
     newChatId: mintChatId,
@@ -231,36 +681,265 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     // A named failure, on screen. `app/src/engines.ts` promises exactly this
     // and nothing rendered it: an unusable engine used to be an unhandled
     // branch that left a blank page.
+    //
+    // Reached now only by a PERMANENT failure -- storage that will not open, a
+    // protocol mismatch. An engine that is merely unreachable boots and warns
+    // instead; see below.
     renderFatal(root, strings.bootFailed(booted.detail));
     return null;
   }
 
   const app = booted.app;
 
+  // The engine is not answering, but the app is usable. Said out loud rather
+  // than left for the first message to discover -- and assertive, because the
+  // user is about to type into something that cannot reply yet.
+  //
+  // This branch exists because refusing to boot on an unreachable engine left
+  // the user on an error screen with no way back: they cannot open Settings to
+  // change the address, because Settings is where the address is changed.
+  if (booted.notReady !== undefined) {
+    const warning = doc.createElement("p");
+    warning.className = "row row-notice";
+    warning.dataset["tone"] = "warning";
+    warning.textContent = strings.engineNotReady(booted.notReady.detail);
+    transcript.append(warning);
+    assertive.textContent = strings.engineNotReady(booted.notReady.detail);
+  }
+
   // ---- the shell drives layout -------------------------------------------
+  // Derived through `geometryOf`, not inline px. The pure derivation is what
+  // makes the keyboard cover the home indicator (`max`, never `+`) and what
+  // turns a WebView's mid-rotation NaN into 0 rather than a dropped style
+  // declaration that drops the composer under the keyboard. The physical
+  // left/right edges then become logical padding, so RTL puts the safe-area on
+  // the leading edge.
   const applyGeometry = (): void => {
-    const insets = platform.shell.insets;
-    screen.style.setProperty("--keyboard-height", `${platform.shell.keyboardHeightPx}px`);
-    screen.style.setProperty("--inset-top", `${insets.top}px`);
+    let layout = initialLayout(platform.shell.insets);
+    layout = withInsets(layout, platform.shell.insets);
+    layout = withKeyboard(layout, platform.shell.keyboardHeightPx);
+    const geometry = geometryOf(layout);
+    screen.style.setProperty("--keyboard-height", `${geometry.composerBottomPx}px`);
+    screen.style.setProperty("--inset-top", `${geometry.scrollTopPx}px`);
+    const logical = logicalInsets(bundle.direction, geometry.composerLeftPx, geometry.composerRightPx);
+    // The GUTTER is added here, not left to the stylesheet. An inline style
+    // beats `app.css`'s `calc(var(--safe-area-inset-left) + .75rem)`, so
+    // writing the bare inset put the composer flush against the screen edge
+    // while the topbar and transcript kept their gutter -- measured at a 320px
+    // viewport with no side insets: the textarea's left edge sat at x = 0.
+    composer.style.setProperty("padding-inline-start", `calc(${logical.startPx}px + .75rem)`);
+    composer.style.setProperty("padding-inline-end", `calc(${logical.endPx}px + .75rem)`);
   };
   applyGeometry();
   platform.shell.onInsetsChanged(applyGeometry);
   platform.shell.onKeyboardHeightChanged(applyGeometry);
 
+  // ---- screens the router drives -----------------------------------------
+  // The chat screen is retained (it holds scroll position and a live stream);
+  // settings and chats are built on demand and rebuilt each visit. `transition`
+  // decides what to mount, hide and destroy; this half only obeys it.
+  const screens = createScreens({
+    root,
+    build: (id: ScreenId): HTMLElement => {
+      if (id === "settings") return buildSettingsScreen(doc, app.settings, strings);
+      if (id === "chats") {
+        // A fresh snapshot each visit: a chat created since the list was last
+        // seen must appear, and one deleted must be gone.
+        const section = buildChatsScreen(doc, [], [], deps.now?.() ?? Date.now(), strings);
+        void (async (): Promise<void> => {
+          const [summaries, unreadable] = await Promise.all([
+            app.session.list(),
+            app.session.repository.listUnreadable(),
+          ]);
+          const fresh = buildChatsScreen(
+            doc,
+            summaries as readonly ChatSummary[],
+            unreadable,
+            deps.now?.() ?? Date.now(),
+            strings,
+          );
+          section.textContent = "";
+          for (const child of [...fresh.children]) section.append(child as HTMLElement);
+        })().catch(() => {
+          // Storage can reject while the list loads -- SecurityError with site
+          // data blocked, QuotaExceededError. A floating rejection here reaches
+          // the global crash handler and replaces the WHOLE app with the fatal
+          // screen; a failed chat list must stay a LOCAL failure, so the user
+          // can go back and keep using the conversation they are in.
+          section.textContent = "";
+          const notice = doc.createElement("p");
+          notice.className = "row row-notice";
+          notice.dataset["tone"] = "warning";
+          notice.setAttribute("role", "alert");
+          notice.textContent = strings.crashed;
+          section.append(notice);
+        });
+        return section;
+      }
+      // "about" and "chat" have no builder here: chat is the pre-built root
+      // screen, and about is not yet a route the app pushes.
+      return doc.createElement("section");
+    },
+  });
+  // The chat screen already exists; register it so `transition` treats it as
+  // live and retains it rather than trying to build a second one.
+  screens.nodes.set("chat", screen);
+
+  // The element by its `data-focus-id`, searched under root. There is no
+  // `querySelector` in the seam a test drives, and there does not need to be:
+  // the set of focusable ids is tiny (a heading per live screen), so a walk is
+  // both correct and cheap.
+  const byFocusId = (id: string): HTMLElement | null => {
+    if (id === "") return null;
+    const stack: HTMLElement[] = [root];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (node === undefined) break;
+      if (node.dataset["focusId"] === id) return node;
+      for (const child of node.children) {
+        if (child instanceof HTMLElement) stack.push(child);
+      }
+    }
+    return null;
+  };
+
+  // Whatever the renderer must return to when a Back gesture pops a screen. A
+  // pop restores focus to the control that opened the screen -- the chat row,
+  // the settings button -- so the user lands where they were, not at the top of
+  // a list they have to scroll down again.
+  let restoreFocus: HTMLElement | null = null;
+
+  // The three lines focus.ts deliberately does NOT do -- move focus, save it,
+  // restore it -- because they are the only part it cannot unit test. Doing
+  // less than this leaves the decision computed and discarded, which is the
+  // very "focus falls to <body>" bug the whole module exists to prevent.
+  const applyFocus = (target: FocusTarget): void => {
+    switch (target.kind) {
+      case "none":
+        return;
+      case "element": {
+        byFocusId(target.id)?.focus();
+        return;
+      }
+      case "restore": {
+        // The saved element may be gone -- popping back after deleting the chat
+        // you were viewing means the row you came from no longer exists -- so
+        // fall back to the destination's heading rather than focusing nothing.
+        const saved = restoreFocus;
+        if (saved !== null && saved.isConnected) saved.focus();
+        else byFocusId(target.fallbackId)?.focus();
+        restoreFocus = null;
+        return;
+      }
+    }
+  };
+
+  let currentRoute: Route | null = null;
+  const showRoute = (route: Route, nav: Navigation): void => {
+    const change = transition(currentRoute, route, screens.live());
+    if (!change.noop) screens.apply(change);
+    const focus = focusForRoute(currentRoute, route, nav);
+    // Announce the screen change, so a route change is never silent to a
+    // screen reader even when focus lands somewhere with a short name.
+    if (focus.kind === "element" && focus.id !== "") {
+      assertive.textContent = screenAnnouncement(strings, route);
+    }
+    // Then actually move focus. Computing the target and never applying it left
+    // focus on the screen the user just left, or on <body> once that screen was
+    // hidden -- exactly the failure focus.ts's ids exist to fix.
+    applyFocus(focus);
+    currentRoute = route;
+  };
+  // The router's root is `chats`, but the app opens on the chat screen; align
+  // the two so the first back gesture behaves and `screenFor` agrees.
+  currentRoute = { name: "chat", chatId: "" };
+  screen.hidden = false;
+  // The previous stack depth, to tell a push from a pop: a shorter stack is a
+  // Back, a longer one a forward navigation. The replace below seeds it at 1.
+  let previousDepth = 1;
+  app.router.subscribe((stack) => {
+    const top = stack[stack.length - 1];
+    if (top === undefined) return;
+    const nav: Navigation =
+      stack.length < previousDepth ? "pop" : stack.length > previousDepth ? "push" : "replace";
+    // Save the control the user is leaving from BEFORE the DOM changes, so a
+    // later pop can return to it. Only on a push -- a pop consumes the saved
+    // target, and a replace is not a place to come back to.
+    if (nav === "push") {
+      const active = doc.activeElement;
+      restoreFocus = active instanceof HTMLElement ? active : null;
+    }
+    previousDepth = stack.length;
+    showRoute(top, nav);
+  });
+  // Replace the router's `chats` root with the chat the app actually opens on,
+  // so pushing `chats` later is a real navigation and not swallowed as a push
+  // of the route already on top.
+  app.router.replace({ name: "chat", chatId: "" });
+
   // ---- taps ---------------------------------------------------------------
+  /** The tags that HOLD a value. Checked by tag rather than by reading
+   *  `node.value` on everything, because `Actionable.value` being ABSENT is
+   *  what tells intents.ts "this element is not a field" -- and a `<div>` in
+   *  the fake DOM reports `""`, which would read as a cleared setting. */
+  const FIELD_TAGS = new Set(["INPUT", "SELECT", "TEXTAREA"]);
+
   const chainOf = (target: EventTarget | null): Actionable[] => {
     const chain: Actionable[] = [];
     let node = target instanceof Element ? target : null;
     while (node !== null) {
       if (node instanceof HTMLElement) {
+        const value = (node as HTMLElement & { value?: unknown }).value;
         chain.push({
           dataset: { ...node.dataset },
           ...(node instanceof HTMLButtonElement ? { disabled: node.disabled } : {}),
+          ...(FIELD_TAGS.has(node.tagName) && typeof value === "string" ? { value } : {}),
         });
       }
       node = node.parentElement;
     }
     return chain;
+  };
+
+  /**
+   * Put every settings field back in step with the STORE, and show or clear
+   * the refusal for one key.
+   *
+   * A walk rather than a captured element, for two reasons. The settings
+   * screen is rebuilt on every visit (`screens.build`), so any reference held
+   * across a navigation points at a detached node. And a `set` the store
+   * ACCEPTS can still store something other than what was typed -- a def's
+   * `validate` may clamp -- so the honest thing after any write, accepted or
+   * refused, is to redraw the fields from what is actually stored rather than
+   * to leave the typed text on screen.
+   */
+  const syncSettings = (key: string, refusal: string | null): void => {
+    const defs = new Map(app.settings.defs().map((d) => [d.key, d]));
+    const stack: HTMLElement[] = [root];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (node === undefined) break;
+      for (const child of node.children) {
+        if (child instanceof HTMLElement) stack.push(child);
+      }
+      if (node.dataset["action"] === "set-setting") {
+        const def = defs.get(node.dataset["settingKey"] ?? "");
+        if (def !== undefined) {
+          (node as HTMLElement & { value: string }).value = String(
+            app.settings.get(def.key) ?? def.default,
+          );
+        }
+        continue;
+      }
+      const errorFor = node.dataset["settingError"];
+      if (errorFor === undefined) continue;
+      // Only this key's note is touched. Clearing them all would wipe a
+      // refusal the user has not read off a DIFFERENT setting; leaving them
+      // all would keep accusing a write that has since succeeded.
+      if (errorFor !== key) continue;
+      node.textContent = refusal ?? "";
+      node.hidden = refusal === null;
+    }
   };
 
   const perform = async (intent: Intent): Promise<void> => {
@@ -288,6 +967,8 @@ export async function mount(deps: MountDeps): Promise<App | null> {
         // the same id".
         app.controller.setChat(mintChatId());
         app.session.reset();
+        // A fresh chat has no history to keep above the next turn.
+        history = [];
         render = emptyRender;
         nodes.nodes.clear();
         announcer = initialAnnouncer;
@@ -304,27 +985,156 @@ export async function mount(deps: MountDeps): Promise<App | null> {
       case "navigate":
         app.router.push({ name: intent.route } as Route);
         return;
+      case "set-setting": {
+        // The def is looked up from the LIVE facade, not from `SETTING_DEFS`,
+        // so this cannot drift from what the screen was rendered off. An
+        // unknown key means the DOM and the registry disagree -- refuse it
+        // rather than write it: `set` would refuse anyway, silently.
+        const def = app.settings.defs().find((d) => d.key === intent.key);
+        if (def === undefined) return;
+        // `validateInput` first, so an unparseable value never reaches `set`
+        // where the refusal comes back as a bare `false` with no reason.
+        const validated = validateInput(def, intent.raw);
+        let stored = false;
+        if (validated !== null) {
+          try {
+            stored = await app.settings.set(intent.key, validated);
+          } catch {
+            // `set` persists through StoragePort, which REJECTS on a real
+            // device (SecurityError with site data blocked, QuotaExceededError
+            // under storage pressure). Left to float, that rejection reaches
+            // the global crash handler and replaces the WHOLE app with the
+            // fatal screen. A failed settings write must stay local -- and it
+            // is a refusal like any other, so it is said rather than swallowed.
+            stored = false;
+          }
+        }
+        // Said, not merely undone. A field that snaps back in silence is
+        // indistinguishable from a mis-tap or from a save that worked, and on
+        // this screen that leaves someone re-typing the same refused value.
+        const refusal = stored ? null : strings.settingRejected(labelOf(def));
+        if (refusal !== null) assertive.textContent = refusal;
+        syncSettings(intent.key, refusal);
+        return;
+      }
+      case "open-chat": {
+        // Reopen a previous conversation. `session.list()` had no app caller and
+        // `session.open()` no way to be reached; this is the path from the chat
+        // list back into a stored transcript.
+        const opened = await app.session.open(intent.chatId);
+        if (!opened) return;
+        app.controller.setChat(intent.chatId);
+        render = emptyRender;
+        nodes.nodes.clear();
+        announcer = initialAnnouncer;
+        transcript.textContent = "";
+        polite.textContent = "";
+        assertive.textContent = "";
+        // Paint the stored messages THROUGH the reconciler, not as raw nodes.
+        //
+        // Appending untracked `<p>` elements and resetting `render` to empty was
+        // a defect: the next turn reconciled from an empty render state and
+        // `applyOps` inserted its rows at index 0 -- ABOVE the history -- while
+        // the manually appended messages stayed outside `render`/`nodes` and
+        // could never be updated. The newest turn rendered above the older
+        // conversation. Holding the history as real `Row`s and prepending it in
+        // `publish` keeps it in the same coordinate system the stream appends to
+        // AND makes it survive the next turn's reconcile.
+        const chat = app.session.current();
+        history = chat === null ? [] : historyRows(chat.messages);
+        const seeded = reconcile(render, history);
+        applyOps(transcript, nodes, seeded.ops, strings);
+        render = seeded.next;
+        app.router.push({ name: "chat", chatId: intent.chatId });
+        return;
+      }
       default:
         return;
     }
   };
 
   const submit = async (): Promise<void> => {
+    // The field is the live edit; the composer state is the durable draft. Take
+    // from the field so a test that sets `input.value` directly still sends, and
+    // clear both -- `submitComposer` is what makes a double tap on send a no-op.
     const text = input.value.trim();
     if (text === "") return; // an empty send is a no-op, not an empty turn
+    const busy = sendButton.dataset["action"] === "stop";
+    composerState = setDraft(composerState, input.value);
+    const result = submitComposer(composerState, busy);
+    composerState = result.next;
     input.value = "";
-    await app.controller.send(text);
+    syncComposer();
+    if (result.sent === null) return; // refused while a turn is in flight
+    await app.controller.send(result.sent);
   };
+
+  // ---- composer field <-> state ------------------------------------------
+  input.addEventListener("input", () => {
+    composerState = setDraft(composerState, input.value);
+    input.style.setProperty("height", `${heightFor(lineCountOf(input.value))}px`);
+    if (sendButton.dataset["action"] !== "stop") {
+      sendButton.disabled = input.value.trim() === "";
+    }
+  });
+  input.addEventListener("keydown", (event) => {
+    const e = event as KeyboardEvent;
+    const action = keyAction({
+      key: e.key,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      isComposing: e.isComposing,
+    });
+    if (action === "send") {
+      e.preventDefault();
+      void submit();
+    }
+    // "newline" and "ignore" both let the field handle the key normally.
+  });
+  syncComposer();
+
+  // ---- scroll follow ------------------------------------------------------
+  transcript.addEventListener("scroll", () => {
+    follow = onScroll(follow, metricsOf());
+    applyFollow();
+  });
 
   composer.addEventListener("submit", (event) => {
     event.preventDefault();
     void submit();
   });
 
-  screen.addEventListener("click", (event) => {
+  // Delegated on ROOT, not the chat screen: the settings and chats screens are
+  // siblings of it, so a tap on a chat row would otherwise never be heard.
+  root.addEventListener("click", (event) => {
+    const target = event.target;
+    // Jump-to-latest is not an intent (it is a scroll decision, not an engine
+    // call), so it is handled here before the intent walk.
+    const chain = chainOf(target);
+    if (chain.some((el) => el.dataset["action"] === "jump-latest")) {
+      const outcome = jumpToLatest(follow, metricsOf());
+      follow = outcome.state;
+      if (outcome.action.kind === "scrollTo") transcript.scrollTop = outcome.action.top;
+      applyFollow();
+      (event as { preventDefault(): void }).preventDefault();
+      return;
+    }
+    const intent = intentFrom(chain);
+    if (intent === null) return;
+    (event as { preventDefault(): void }).preventDefault();
+    void perform(intent);
+  });
+
+  // Committing a field is delegated on ROOT for the same reason a tap is: the
+  // settings screen is rebuilt on every visit, so a listener attached to a
+  // field belongs to a node that is thrown away on the next navigation. No
+  // `preventDefault` -- `change` has no default action to cancel, and the
+  // composer's textarea carries no `data-action`, so `intentFrom` refuses it.
+  root.addEventListener("change", (event) => {
     const intent = intentFrom(chainOf(event.target));
     if (intent === null) return;
-    event.preventDefault();
     void perform(intent);
   });
 
@@ -336,5 +1146,3 @@ const el = globalThis.document?.getElementById("root");
 if (el !== null && el !== undefined) {
   void mount({ root: el });
 }
-
-export { OPENAI_KEY };

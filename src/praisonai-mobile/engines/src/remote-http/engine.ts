@@ -29,8 +29,18 @@ import { createSseReader } from "../../../protocol/src/sse.ts";
 import { classify, type Readiness } from "./readiness.ts";
 
 export interface RemoteHttpOptions {
-  /** Base URL of the engine, no trailing slash. */
-  readonly baseUrl: string;
+  /**
+   * Base URL of the engine, no trailing slash.
+   *
+   * A RESOLVER is accepted as well as a string, and the difference is the
+   * whole recovery path for a device that cannot reach its engine. This engine
+   * is constructed once, at boot, and the app holds it for the session -- so a
+   * captured string means the address the user corrects in Settings is
+   * persisted, displayed, and then ignored until the app is force-quit. A
+   * function is re-read per request, so the next message goes where the user
+   * just said. A plain string still works and still means "this one, forever".
+   */
+  readonly baseUrl: string | (() => string);
   readonly http: HttpPort;
   /** Sent as a bearer token when present. The desktop engine is unauthenticated
    *  on loopback; anything off-device must not be. */
@@ -51,8 +61,26 @@ const CAPABILITIES: EngineCapabilities = {
 };
 
 export function createRemoteHttpEngine(options: RemoteHttpOptions): AgentEnginePort {
-  const base = options.baseUrl.replace(/\/+$/, "");
+  // Resolved per call, never captured. The trailing slash is stripped here
+  // rather than at the caller because a resolver's answer is not seen until
+  // now: `${base}/chat` against "http://host/" produces a double slash, which
+  // some servers 404 and others redirect -- losing the POST body.
+  const base = (): string =>
+    (typeof options.baseUrl === "string" ? options.baseUrl : options.baseUrl()).replace(/\/+$/, "");
   const id = options.id ?? "remote-http";
+
+  // Where each in-flight run was STARTED. A resolver means `base()` can move
+  // between calls -- that is the whole point, so the next /chat reaches the
+  // address the user just fixed. But a run's /cancel, and an approval's
+  // /approve, are addressed by an id the ORIGINATING engine minted; sending
+  // them to a newly-corrected address hands a foreign id to an engine that
+  // never issued it, which refuses it -- and controller.ts only aborts the
+  // local reader once cancel returns true, so the original turn keeps
+  // generating at the old address while the user believes they stopped it.
+  // Pinning the id to the base it was born at keeps a mid-turn address change
+  // from redirecting the control request off the run it belongs to.
+  const runBase = new Map<string, string>();
+  const approvalBase = new Map<string, string>();
 
   const headers = (extra: Record<string, string> = {}): Record<string, string> => ({
     "content-type": "application/json",
@@ -77,11 +105,11 @@ export function createRemoteHttpEngine(options: RemoteHttpOptions): AgentEngineP
   /** POST a small JSON request and read `{ok: boolean}` out of the reply.
    *  Returns false on anything that is not an explicit success -- reporting
    *  success for an unknown id "would be a lie the UI cannot detect". */
-  const postOk = async (path: string, body: unknown): Promise<boolean> => {
+  const postOk = async (path: string, body: unknown, origin: string): Promise<boolean> => {
     try {
       const response = await options.http.send({
         method: "POST",
-        url: `${base}${path}`,
+        url: `${origin}${path}`,
         headers: headers(),
         body: JSON.stringify(body),
         signal: new AbortController().signal,
@@ -106,9 +134,14 @@ export function createRemoteHttpEngine(options: RemoteHttpOptions): AgentEngineP
     capabilities: CAPABILITIES,
 
     async *run(request: RunRequest, signal: AbortSignal): AsyncIterable<RunEvent> {
+      // Resolved ONCE, here, and remembered for this run's control requests.
+      // The /chat POST and every later /cancel for this runId must reach the
+      // same engine even if Settings changes the address mid-stream.
+      const origin = base();
+      runBase.set(request.runId, origin);
       const response = await options.http.send({
         method: "POST",
-        url: `${base}/chat`,
+        url: `${origin}/chat`,
         headers: headers({ accept: "text/event-stream" }),
         body: JSON.stringify({
           prompt: request.prompt,
@@ -164,6 +197,12 @@ export function createRemoteHttpEngine(options: RemoteHttpOptions): AgentEngineP
             }
             const outcome = decodeEvent({ ...parsed.value, type: frame.event });
             if (isDecoded(outcome)) {
+              // An approval blocks the run and is answered by an id THIS engine
+              // minted, so its /approve must land back here even after Settings
+              // moves the address. Pinned to the run's origin, not `base()`.
+              if (outcome.event.type === "approval_request") {
+                approvalBase.set(outcome.event.approvalId, origin);
+              }
               yield outcome.event;
             } else {
               options.onIgnored?.(outcome.reason, outcome.detail);
@@ -173,15 +212,29 @@ export function createRemoteHttpEngine(options: RemoteHttpOptions): AgentEngineP
       } finally {
         // Release the socket whether we finished, aborted, or threw.
         await reader.cancel().catch(() => {});
+        // The run is over: its id can no longer be cancelled meaningfully, so
+        // drop the pin rather than let the map grow for the session. A /cancel
+        // that races the natural end falls back to `base()` -- harmless, the
+        // run is already gone. Approval pins outlive the map entry only until
+        // decided; they are cleared in `decide`.
+        runBase.delete(request.runId);
       }
     },
 
     async decide(approvalId: string, choice: ApprovalChoice): Promise<boolean> {
-      return postOk(`/approve/${encodeURIComponent(approvalId)}`, { choice });
+      // The engine that asked is the engine that must be told. Fall back to the
+      // live resolver only for an id this instance never saw (a resumed app
+      // that reconnected), where the current address is the best guess left.
+      const origin = approvalBase.get(approvalId) ?? base();
+      const ok = await postOk(`/approve/${encodeURIComponent(approvalId)}`, { choice }, origin);
+      approvalBase.delete(approvalId);
+      return ok;
     },
 
     async cancel(runId: string): Promise<boolean> {
-      return postOk(`/cancel/${encodeURIComponent(runId)}`, {});
+      // Pinned to where the run STARTED. A mid-turn address change must not
+      // redirect the stop to an engine that never issued this runId.
+      return postOk(`/cancel/${encodeURIComponent(runId)}`, {}, runBase.get(runId) ?? base());
     },
 
     async dispose(): Promise<void> {
@@ -226,32 +279,54 @@ function parseFrame(data: string): ParsedFrame {
   return { ok: true, value: parsed as Record<string, unknown> };
 }
 
+/** How long a boot-time probe waits before giving up. This runs BEFORE the app
+ *  mounts, so an endpoint that accepts the connection but never answers -- or
+ *  never closes its body -- would otherwise hang `selectEngine`, `createApp`
+ *  and the whole mount forever. A bounded deadline turns that stall into a
+ *  named, retryable transport failure instead. */
+export const PROBE_TIMEOUT_MS = 5000;
+
 /** Probe `/health` and classify it. Separate from the engine so a connection
- *  manager can check readiness before offering the engine at all. */
+ *  manager can check readiness before offering the engine at all.
+ *
+ *  Bounded by `timeoutMs`: the probe blocks boot, so a request or body read
+ *  that never completes must abort rather than pin the app on a blank screen.
+ *  A timeout is classified as retryable transport -- a still-starting engine is
+ *  exactly the case worth polling. */
 export async function probeHealth(
   http: HttpPort,
   baseUrl: string,
   token?: string,
+  timeoutMs: number = PROBE_TIMEOUT_MS,
 ): Promise<Readiness> {
   const base = baseUrl.replace(/\/+$/, "");
+  // Abort BOTH the request and the body read below off one deadline: the reader
+  // shares this response, so aborting the signal unblocks a stalled read too.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await http.send({
       method: "GET",
       url: `${base}/health`,
       headers: token === undefined ? {} : { authorization: `Bearer ${token}` },
-      signal: new AbortController().signal,
+      signal: controller.signal,
     });
     const body = response.body;
     let text = "";
     if (body !== null) {
       const reader = body.getReader();
       const decoder = new TextDecoder();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        text += decoder.decode(value, { stream: true });
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          text += decoder.decode(value, { stream: true });
+        }
+        text += decoder.decode();
+      } finally {
+        // Release the stream lock so an aborted read does not leak the reader.
+        reader.releaseLock();
       }
-      text += decoder.decode();
     }
     return classify({ kind: "http", status: response.status, body: text });
   } catch (error) {
@@ -259,5 +334,7 @@ export async function probeHealth(
       kind: "transport",
       detail: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    clearTimeout(timer);
   }
 }

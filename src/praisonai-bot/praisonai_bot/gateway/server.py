@@ -626,6 +626,26 @@ class ReloadPlan:
         self.restart_channels.clear()  # No need for selective restarts
 
 
+class _TerminalTurn(str):
+    """A terminal turn response that also carries its outcome classification.
+
+    A driven turn normally returns the agent's reply string with an implicit
+    ``ok`` outcome. Some terminal endings (e.g. a wedged worker torn down by the
+    executor) *are* the reply text the client should see but must NOT be
+    classified as a successful turn. Subclassing ``str`` keeps every existing
+    consumer (``session.add_message``, the ``content`` frame, ``.lower()`` in
+    tests) working unchanged, while ``outcome_status`` lets the session queue
+    report the true terminal outcome instead of a default ``ok``.
+    """
+
+    __slots__ = ("outcome_status",)
+
+    def __new__(cls, value: str, *, outcome_status: str = "ok") -> "_TerminalTurn":
+        obj = super().__new__(cls, value)
+        obj.outcome_status = outcome_status
+        return obj
+
+
 class WebSocketGateway:
     """WebSocket gateway server for multi-agent coordination.
     
@@ -857,6 +877,16 @@ class WebSocketGateway:
                 ``gateway.yaml``. ``None`` preserves today's per-platform keys.
         """
         self.config = config or GatewayConfig(host=host, port=port)
+
+        # Issue #4766: resolve the per-session turn-execution seam. ``None`` (the
+        # default) resolves to the zero-cost in-process executor, so every turn
+        # runs on the current loop exactly as before — byte-for-byte backward
+        # compatible. Supplying an isolated executor via ``GatewayConfig.executor``
+        # is what contains a wedged/runaway turn to its own worker instead of the
+        # process-wide ``os._exit`` remedy.
+        from praisonaiagents.gateway.protocols import InProcessTurnExecutor
+
+        self._executor = getattr(self.config, "executor", None) or InProcessTurnExecutor()
 
         # Issue #3020: shared cross-platform identity resolver. Mirrors BotOS —
         # stamped onto each channel bot's session manager in ``start_channels``
@@ -3511,7 +3541,7 @@ class WebSocketGateway:
 
     @staticmethod
     async def _dispatch_agent_turn(
-        agent: Any, content: str, interrupt: Any = None
+        agent: Any, content: str, interrupt: Any = None, on_complete: Any = None
     ) -> Any:
         """Execute a single agent turn.
 
@@ -3530,12 +3560,31 @@ class WebSocketGateway:
         controller would let one session's abort/timeout interrupt another. A
         legacy fallback stamps ``agent.interrupt_controller`` only for agents
         whose entry point does not accept ``cancel_token``.
+
+        Issue #4656: ``on_complete(agent)`` — when supplied — is invoked
+        **synchronously in the same execution context that produced the turn's
+        result, before that context is handed back to the loop**. For a
+        sync-only agent this runs *inside the worker thread* right after
+        ``agent.chat`` returns, so per-turn state the agent stores on shared,
+        mutable attributes (e.g. ``llm.last_token_metrics``) is snapshotted for
+        *this* turn before any concurrent turn — on another worker thread or a
+        later event-loop tick — can overwrite it. This closes the cross-request
+        usage-misattribution race for the sync ``chat`` fallback (Greptile/Qodo
+        P1). The callback must be non-blocking and must not raise; its return
+        value is ignored.
         """
         _kw = {"cancel_token": interrupt} if interrupt is not None else {}
 
+        def _snapshot() -> None:
+            if on_complete is not None:
+                try:
+                    on_complete(agent)
+                except Exception:
+                    pass
+
         async def _call_async(fn: Any) -> Any:
             try:
-                return await fn(content, **_kw)
+                result = await fn(content, **_kw)
             except TypeError:
                 if not _kw:
                     raise
@@ -3543,7 +3592,11 @@ class WebSocketGateway:
                 # attribute for this turn (best-effort, non-isolated).
                 if hasattr(agent, "interrupt_controller"):
                     agent.interrupt_controller = interrupt
-                return await fn(content)
+                result = await fn(content)
+            # No ``await`` between the turn completing and the snapshot: the
+            # single-threaded loop cannot run another turn in between.
+            _snapshot()
+            return result
 
         for _name in ("arun", "achat"):
             _fn = getattr(agent, _name, None)
@@ -3554,13 +3607,18 @@ class WebSocketGateway:
 
         def _call_sync() -> Any:
             try:
-                return agent.chat(content, **_kw)
+                result = agent.chat(content, **_kw)
             except TypeError:
                 if not _kw:
                     raise
                 if hasattr(agent, "interrupt_controller"):
                     agent.interrupt_controller = interrupt
-                return agent.chat(content)
+                result = agent.chat(content)
+            # Snapshot in *this* worker thread, immediately after the turn
+            # produced its result, before the thread returns to the pool and a
+            # concurrent turn can overwrite the agent's shared metrics.
+            _snapshot()
+            return result
 
         return await loop.run_in_executor(None, _call_sync)
 
@@ -3613,7 +3671,7 @@ class WebSocketGateway:
         content: str,
         controller: Any,
         timeout: float,
-    ) -> Any:
+    ) -> Any:  # noqa: D401 - see _TerminalTurn for the outcome-carrying return
         """Run one agent turn cancellably and under an optional per-turn timeout.
 
         Registers the driving task in ``_active_turns`` so ``_abort_active_turn``
@@ -3630,10 +3688,30 @@ class WebSocketGateway:
         actually finish before advancing the serial session queue — otherwise a
         timed-out sync turn could keep mutating shared agent state concurrently
         with the next turn.
+
+        Issue #4766: the turn is dispatched *through the configured turn
+        executor* — ``place(session_id)`` obtains the placement that owns the
+        session's turns, then ``execute_turn`` runs it on that placement. The
+        default in-process executor awaits the turn on this loop exactly as
+        before (byte-for-byte). If an isolated executor raises
+        ``WorkerWedgedError``, only that session's worker is torn down and the
+        session recovered — the wedge no longer forces a whole-process exit.
         """
+        from praisonaiagents.gateway.protocols import WorkerWedgedError
+
         sid = session.session_id
+
+        async def _turn() -> Any:
+            return await self._dispatch_agent_turn(
+                agent, content, interrupt=controller
+            )
+
+        placement = await self._executor.place(sid)
+        limits = getattr(self.config, "executor_limits", None)
         task = asyncio.ensure_future(
-            self._dispatch_agent_turn(agent, content, interrupt=controller)
+            self._executor.execute_turn(
+                placement, _turn, cancel_token=controller, limits=limits
+            )
         )
         self._active_turns[sid] = (task, controller)
         try:
@@ -3648,6 +3726,21 @@ class WebSocketGateway:
             reason = controller.reason or "user"
             await self._settle_cancelled_turn(task, controller, reason)
             return self._finalise_aborted_turn(controller, reason)
+        except WorkerWedgedError:
+            # Scope the blast radius to this session only: reclaim the wedged
+            # worker and let the session be re-placed on its next turn, instead
+            # of the process-wide ``os._exit`` a shared loop would force.
+            try:
+                await self._executor.teardown(placement, reason="wedged")
+            except Exception:
+                logger.warning(
+                    "Executor teardown failed for wedged session %s", sid,
+                    exc_info=True,
+                )
+            return _TerminalTurn(
+                "Turn cancelled: worker wedged; session will be re-placed.",
+                outcome_status="error",
+            )
         finally:
             existing = self._active_turns.get(sid)
             if existing is not None and existing[0] is task:
@@ -3748,6 +3841,14 @@ class WebSocketGateway:
                     logger.error(f"Agent error in queue processor: {e}")
                     response = f"Error: {str(e)}"
                     outcome_status = "error"
+                else:
+                    # A terminal turn (e.g. a wedged worker torn down by the
+                    # executor) carries its own outcome so a non-ok ending is
+                    # not misreported as a successful turn. Regular replies
+                    # keep the default ``ok``.
+                    carried = getattr(response, "outcome_status", None)
+                    if carried is not None:
+                        outcome_status = carried
                 finally:
                     # Always clean up the relay callback
                     if relay_callback and emitter is not None:
@@ -7518,6 +7619,33 @@ class WebSocketGateway:
         elif hasattr(bot, "_identity_resolver"):
             bot._identity_resolver = resolver
 
+    def _build_turn_lock_map(self) -> Any:
+        """Build the gateway's per-turn lock backend from config (Issue #4655).
+
+        Honours ``gateway.turn_lock.backend``: the default ``"local"`` returns a
+        plain in-process ``LockMap`` (today's behaviour, byte-for-byte), while
+        ``"redis"`` returns a ``RedisTurnLock`` reusing the push ``RedisConfig``
+        so turns serialise cluster-wide across replicas. Construction fails open
+        (local fallback + a degraded record) so an outage never wedges startup.
+        """
+        cfg = getattr(self, "config", None)
+        turn_lock = getattr(cfg, "turn_lock", None)
+        push = getattr(cfg, "push", None)
+        redis_config = getattr(push, "redis", None)
+        try:
+            from ..bots._redis_turn_lock import build_turn_lock
+
+            return build_turn_lock(
+                turn_lock,
+                redis_config,
+                degraded_registry=getattr(self, "_degraded_registry", None),
+            )
+        except Exception as e:  # pragma: no cover - defensive: never block startup
+            logger.warning("Failed to build turn lock backend: %s", e)
+            from .._lockmap import LockMap
+
+            return LockMap()
+
     def _stamp_turn_lock_map(self, bot: Any) -> None:
         """Share one per-turn ``LockMap`` with a channel bot (Issue #3232).
 
@@ -7538,12 +7666,19 @@ class WebSocketGateway:
         ``start_channels`` and ``_start_single_channel`` (hot-reload) so a
         restarted channel keeps sharing the same lock map.
         """
-        if getattr(self, "_identity_resolver", None) is None:
+        # A local backend only unifies distinct channels onto one session when an
+        # identity resolver is configured (Issue #3232), so without a resolver it
+        # stays a no-op and each channel keeps its own map (today's behaviour). A
+        # distributed (``redis``) backend, however, must serialise across replicas
+        # of even a *single* channel, so it is wired unconditionally (Issue #4655).
+        cfg = getattr(self, "config", None)
+        turn_lock_cfg = getattr(cfg, "turn_lock", None)
+        distributed = bool(getattr(turn_lock_cfg, "enabled", False))
+        if getattr(self, "_identity_resolver", None) is None and not distributed:
             return
         lock_map = getattr(self, "_turn_lock_map", None)
         if lock_map is None:
-            from .._lockmap import LockMap
-            lock_map = LockMap()
+            lock_map = self._build_turn_lock_map()
             self._turn_lock_map = lock_map
         sess = (
             getattr(bot, "_session", None)

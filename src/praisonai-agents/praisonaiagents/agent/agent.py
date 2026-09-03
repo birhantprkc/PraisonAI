@@ -35,18 +35,6 @@ from ..goal.loop import GoalLoopMixin
 # Module-level logger for thread safety errors and debugging
 logger = get_logger(__name__)
 
-_COMPLETION_NEGATION_RE = re.compile(
-    r'\b(?:not|never|no longer|hardly|barely|isn\'t|aren\'t|wasn\'t|weren\'t|hasn\'t|haven\'t|hadn\'t|won\'t|wouldn\'t|can\'t|couldn\'t|shouldn\'t|don\'t|doesn\'t|didn\'t)\b'
-    r'.{0,20}'
-)
-_COMPLETION_PATTERNS = (
-    (re.compile(r'\btask\s+completed?\b'), False),
-    (re.compile(r'\bcompleted\s+successfully\b'), False),
-    (re.compile(r'\ball\s+done\b'), False),
-    (re.compile(r'\bdone\b'), True),
-    (re.compile(r'\bfinished\b'), True),
-)
-
 # ============================================================================
 # Performance: Lazy imports for heavy dependencies
 # Rich, LLM, and display utilities are only imported when needed (output=verbose)
@@ -391,9 +379,26 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             self._llm_init_params = params
             self._using_custom_llm = True
 
+    def _wire_deferred_history_callback(self):
+        """Point the LLM instance's deferred re-injection at the Agent's own history.
+
+        The LLM's own ``chat_history`` list has no readers when driven by an
+        Agent (Agent passes its separately-maintained history as a parameter),
+        so a resolved ``defer(...)`` result appended there would be lost. Wiring
+        the Agent's thread-safe append here lets background-completed deferred
+        tool results reach the next turn's context.
+        """
+        inst = self._llm_instance
+        if inst is not None:
+            try:
+                inst._agent_history_append = self._append_to_chat_history
+            except Exception:
+                pass
+
     def _ensure_llm_instance(self):
         """Lazy-create LLM instance from deferred init params (avoids import at Agent())."""
         if self._llm_instance is not None:
+            self._wire_deferred_history_callback()
             return self._llm_instance
         if self._panel_descriptor is not None:
             try:
@@ -410,6 +415,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     "LLM features requested but dependencies not installed. "
                     "Please install with: pip install \"praisonaiagents[llm]\""
                 ) from e
+            self._wire_deferred_history_callback()
             return self._llm_instance
         if self._llm_init_params:
             try:
@@ -420,6 +426,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     "LLM features requested but dependencies not installed. "
                     "Please install with: pip install \"praisonaiagents[llm]\""
                 ) from e
+        self._wire_deferred_history_callback()
         return self._llm_instance
 
     @property
@@ -431,6 +438,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         self._llm_instance = value
         if value is not None:
             self._llm_init_params = None
+            self._wire_deferred_history_callback()
 
     def _ensure_loop_guard(self):
         """Lazy-create loop guard on first tool execution."""

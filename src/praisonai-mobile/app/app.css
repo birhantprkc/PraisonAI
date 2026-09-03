@@ -69,6 +69,14 @@ html, body {
 }
 
 .screen { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+/* An AUTHOR `display` beats the user-agent's `[hidden] { display: none }`, so
+   the line above silently defeated `el.hidden = true` in app/src/mount.ts and
+   every screen rendered at once -- measured in headless Chrome: after tapping
+   Settings the chat screen was still on screen at half height with the
+   settings list stacked underneath, and each navigation halved the viewport
+   again. ui/src/screens.ts's mount/hide/unmount logic was correct throughout;
+   only this stylesheet broke it. */
+.screen[hidden] { display: none; }
 
 .topbar {
   display: flex;
@@ -134,7 +142,14 @@ html, body {
   /* main.ts sets this from the shell's live keyboard height. It is a padding
      rather than a transform so the transcript's scroll height shrinks with it
      and the last message stays reachable. */
-  padding-bottom: calc(var(--keyboard-height, 0px) + var(--safe-area-inset-bottom) + .5rem);
+  /* NOT `+ var(--safe-area-inset-bottom)`. `--keyboard-height` is written from
+     `geometryOf`, which is already `max(keyboard, insets.bottom)` -- adding the
+     inset back double-counts it. ui/src/layout/insets.ts calls that sum "the
+     single most recognisable 'web page in a box' tell there is", and it was
+     reintroduced here: measured 76px of padding with a 34px home indicator
+     where 42px is correct, and a keyboard's height of dead space above the
+     keyboard once one opens. */
+  padding-bottom: calc(var(--keyboard-height, 0px) + .5rem);
 }
 .composer textarea {
   flex: 1;
@@ -178,6 +193,19 @@ button:disabled { opacity: .45; cursor: default; }
 .setting .help { color: var(--soft); font-size: .84rem; }
 .setting input, .setting select { font: inherit; font-size: 16px; padding: .45rem .55rem;
   border: 1px solid var(--rule); border-radius: 8px; background: var(--panel); color: inherit; }
+/* A refused setting, next to the field it was refused for. The row builder in
+   main.ts renders `.row-setting`, so the rules above (written against a
+   `.setting` class nothing emits) do not reach it -- these are matched on the
+   class names the app actually paints. `[hidden]` is stated explicitly for the
+   same reason `.screen[hidden]` is: an author `display` declaration beats the
+   user agent's, and an always-visible empty error box beside every field reads
+   as a rendering fault. */
+.row-setting { display: flex; flex-direction: column; gap: .25rem; }
+.row-setting .setting-input { font: inherit; font-size: 16px; padding: .45rem .55rem;
+  border: 1px solid var(--rule); border-radius: 8px; background: var(--panel); color: inherit; }
+.setting-error { display: block; margin: .1rem 0 0; color: var(--warn); font-size: .84rem; }
+.setting-error[hidden] { display: none; }
+
 .section-heading { font-size: .72rem; letter-spacing: .1em; text-transform: uppercase;
   color: var(--soft); margin: 1.2rem 0 .3rem; }
 .warning { border: 1px solid var(--warn); color: var(--warn); border-radius: var(--radius);
