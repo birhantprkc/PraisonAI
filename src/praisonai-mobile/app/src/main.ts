@@ -15,7 +15,7 @@
  */
 import { createApp, type App } from "./boot.ts";
 import { detectPlatform, type Platform } from "./platform.ts";
-import { enginesFor, defaultEngineIdFor, settingDefsFor } from "./registry.ts";
+import { enginesFor, apiKeyFor, defaultEngineIdFor, settingDefsFor } from "./registry.ts";
 import { intentFrom, type Actionable, type Intent } from "./intents.ts";
 import { applyOps, emptyNodes, type RowNodes } from "./dom.ts";
 import { installCrashHandler } from "./crash.ts";
@@ -35,7 +35,15 @@ import {
   type FocusTarget,
   type Navigation,
 } from "../../ui/src/a11y/focus.ts";
-import { buildSettings, labelOf, validateInput, type ValueRow } from "../../ui/src/settings/view-model.ts";
+import {
+  buildSettings,
+  labelOf,
+  presenceLabel,
+  validateInput,
+  type SecretPresence,
+  type SecretRow,
+  type ValueRow,
+} from "../../ui/src/settings/view-model.ts";
 import { buildChatList } from "../../ui/src/chats/list-view-model.ts";
 import type { ChatSummary, StoredMessage } from "../../core/src/chat/repository.ts";
 import { createBundle } from "../../ui/src/i18n/bundle.ts";
@@ -62,10 +70,15 @@ import {
 } from "../../ui/src/transcript/scroll.ts";
 import type { EngineChoice } from "./engines.ts";
 import type { AgentEnginePort } from "../../core/src/ports/agent-engine.ts";
-import { createPraisonTsEngine, type RunPersistence } from "../../engines/src/praisonai-ts/engine.ts";
+import {
+  createPraisonTsEngine,
+  type ConversationHistory,
+  type RunPersistence,
+} from "../../engines/src/praisonai-ts/engine.ts";
 import { loadPraisonAgent, type PraisonAgentModule } from "../../engines/src/praisonai-ts/load-agent.ts";
 import type { PraisonAgent } from "../../engines/src/praisonai-ts/agent-api.ts";
-import type { SettingDef, SettingsFacade } from "../../core/src/settings/store.ts";
+import { secretRefOf, type SettingDef, type SettingsFacade } from "../../core/src/settings/store.ts";
+import type { SecretsPort } from "../../core/src/ports/secrets.ts";
 import type { IgnoredReason } from "../../protocol/src/decode.ts";
 import type { HttpPort } from "../../core/src/ports/http.ts";
 
@@ -88,7 +101,9 @@ import type { HttpPort } from "../../core/src/ports/http.ts";
  */
 async function createInProcessEngine(
   persistence: RunPersistence,
+  history: ConversationHistory,
   settings: SettingsFacade,
+  secrets: SecretsPort,
   loadAgent: () => Promise<PraisonAgentModule>,
 ): Promise<AgentEnginePort> {
   const settingString = (key: string, fallback: string): string => {
@@ -97,14 +112,42 @@ async function createInProcessEngine(
   };
   return createPraisonTsEngine({
     persistence,
+    // The read side of the same store `persistence` writes to. The engine
+    // builds a fresh Agent per turn -- the model and the key come from
+    // settings and can change between messages -- so upstream's own
+    // accumulation dies with each agent and the conversation has to be
+    // restored explicitly on every turn.
+    history,
     createAgent: async (): Promise<PraisonAgent> => {
       // The chunk is fetched here, on the first turn, not at create(): a
       // fetch that fails then surfaces through engine.ts's run loop as a
       // recoverable `error` event rather than as a factory that throws.
       const Agent = await loadAgent();
+      /**
+       * The key, read on EVERY turn.
+       *
+       * The engine is built once, at boot, and held for the session -- so a
+       * key read here at construction would mean the key someone pastes into
+       * Settings does not work until they force-quit the app. That is the
+       * exact defect `enginesFor` fixed for `baseUrl`, and it is worse for a
+       * credential: the failure it produces ("the OPENAI_API_KEY environment
+       * variable is missing or empty") is the same message they were trying to
+       * clear, so the app appears to have ignored them.
+       *
+       * The secret goes into a local and into the agent config and NOWHERE
+       * else: not into settings state, not into a render tree, not into the
+       * announcer. `SecretsPort` is reachable here because this is the
+       * composition root; `ui/` holds a facade with no getter.
+       */
+      const apiKey = await apiKeyFor(secrets, settings.defs());
       return new Agent({
         instructions: "You are a helpful assistant.",
         llm: settingString("model", "gpt-4o-mini"),
+        // Omitted rather than passed as "" or null when unset: upstream treats
+        // a falsy apiKey as "fall back to the environment", and on a phone
+        // there is no environment -- so the honest shape for "no key" is an
+        // absent field and the provider's own missing-credential error.
+        ...(apiKey === null ? {} : { apiKey }),
       });
     },
     newMsgId: () => globalThis.crypto.randomUUID(),
@@ -123,7 +166,21 @@ async function createInProcessEngine(
 export function appEngines(deps: {
   readonly settings: SettingsFacade;
   readonly http: HttpPort;
+  /**
+   * The keychain, handed to the ENGINE and to nothing else.
+   *
+   * Required rather than optional on purpose. An optional port is a
+   * composition that can forget it and still build -- and what it builds is an
+   * engine with no credential, which fails on the first message with a
+   * provider error that names an environment variable no phone has. A missing
+   * argument here is a typecheck failure instead.
+   */
+  readonly secrets: SecretsPort;
   readonly persistence: RunPersistence;
+  /** Where prior turns come from. Required for the same reason `secrets` is:
+   *  an optional one builds an engine that answers every message as though it
+   *  were the first. */
+  readonly history: ConversationHistory;
   readonly onIgnored: (reason: IgnoredReason, detail: string) => void;
   /** How the in-process engine's `Agent` class is fetched. Defaults to the
    *  real chunk loader. A test injects a rejecting one to drive the failure
@@ -135,8 +192,10 @@ export function appEngines(deps: {
     settings: deps.settings,
     http: deps.http,
     persistence: deps.persistence,
+    history: deps.history,
     onIgnored: deps.onIgnored,
-    createInProcess: (persistence) => createInProcessEngine(persistence, deps.settings, loadAgent),
+    createInProcess: (persistence, history) =>
+      createInProcessEngine(persistence, history, deps.settings, deps.secrets, loadAgent),
   });
 }
 
@@ -259,6 +318,66 @@ function settingError(doc: Document, key: string): HTMLElement {
 }
 
 /**
+ * A secret row's controls: a masked field to set it, and a button to remove it.
+ *
+ * THREE properties, and each has a broken version that looks completely normal
+ * on screen.
+ *
+ *  1. `value` IS NEVER ASSIGNED. Not "assigned a masked stand-in" -- never
+ *     assigned. `settingControl` above reads the store to seed its field, and
+ *     the mirror of that line here would be the leak: `SettingsFacade` has no
+ *     secret getter precisely so a view "cannot accidentally fault a key into
+ *     the render tree where it can reach a log, a crash report or a
+ *     screenshot" (store.ts). The field paints empty on every visit, and
+ *     `syncSecret` empties it again after every commit, so the value is in the
+ *     DOM only while the user is holding it there.
+ *  2. `type="password"`, so a shoulder-surfer and a screen recording see dots.
+ *     `autocomplete="off"` and `spellcheck="false"` with it: a browser or
+ *     webview that offers to remember the field, or that ships an unrecognised
+ *     token off to a spellchecker, has moved the credential somewhere nobody
+ *     chose.
+ *  3. PRESENCE IS A SEPARATE NODE, addressed by `data-secret-presence`, so the
+ *     async `hasSecret` can land into it without repainting -- and without
+ *     wiping a key the user is mid-paste. It starts at UNKNOWN, never at "Not
+ *     set": view-model.ts rule 2, "telling someone their key is missing while
+ *     the keychain lookup is still in flight is how a working key gets pasted
+ *     twice".
+ */
+function secretControls(doc: Document, row: SecretRow, strings: Strings): readonly HTMLElement[] {
+  const presence = doc.createElement("span");
+  presence.className = "setting-value setting-presence";
+  presence.dataset["secretPresence"] = row.key;
+  presence.textContent = row.presence;
+
+  const input = doc.createElement("input") as HTMLElement & { type: string; placeholder: string };
+  // NOTE: no `input.value = ...` here, ever. See property 1 above.
+  input.type = "password";
+  input.className = "setting-value setting-input";
+  input.setAttribute("aria-label", row.label);
+  input.placeholder = strings.secretPlaceholder;
+  input.setAttribute("autocomplete", "off");
+  input.setAttribute("autocapitalize", "off");
+  input.setAttribute("autocorrect", "off");
+  input.setAttribute("spellcheck", "false");
+  // `change`, like every other field: committed on blur or Enter, so a
+  // half-pasted key never reaches the keychain.
+  input.dataset["action"] = "set-secret";
+  input.dataset["settingKey"] = row.key;
+
+  const clear = doc.createElement("button") as HTMLElement & { type: string };
+  clear.type = "button";
+  clear.className = "setting-clear";
+  clear.textContent = strings.actionClearSecret;
+  clear.dataset["action"] = "clear-secret";
+  clear.dataset["settingKey"] = row.key;
+  // Named for the key it clears. "Remove" alone, repeated once per secret, is
+  // a list of identical buttons to anyone navigating by control name.
+  clear.setAttribute("aria-label", `${strings.actionClearSecret}: ${row.label}`);
+
+  return [presence, input, clear, settingError(doc, row.key)];
+}
+
+/**
  * The settings screen, built from the live registry via `buildSettings`.
  *
  * Data-driven, so a setting added to the registry appears here without a code
@@ -273,6 +392,10 @@ export function buildSettingsScreen(
   doc: Document,
   settings: SettingsFacade,
   strings: Strings,
+  /** Resolved `hasSecret` answers. Empty by default, which paints every secret
+   *  as UNKNOWN -- the honest first frame for a screen whose keychain lookups
+   *  are async. `refreshSecretPresence` fills the nodes in when they land. */
+  secretPresence: SecretPresence = new Map(),
 ): HTMLElement {
   const section = doc.createElement("section");
   section.className = "screen screen-settings";
@@ -280,7 +403,7 @@ export function buildSettingsScreen(
 
   const defByKey = new Map(settings.defs().map((def) => [def.key, def]));
 
-  const view = buildSettings(settings);
+  const view = buildSettings(settings, secretPresence);
   for (const warning of view.warnings) {
     const note = doc.createElement("p");
     note.className = "row row-notice";
@@ -308,10 +431,16 @@ export function buildSettingsScreen(
         // -- an alert region inserted at the moment it has something to say is
         // announced unreliably by every screen reader.
         el.append(settingControl(doc, def, row, settings), settingError(doc, row.key));
+      } else if (row.kind === "secret") {
+        // Editable, at last. This row was a read-only `<span>` reporting
+        // "Not set" forever: there was no secret def to render it and, had
+        // there been one, no way to fill it in -- which is how the app shipped
+        // with an in-process engine and no field to give it a credential.
+        el.append(...secretControls(doc, row, strings));
       } else {
         const value = doc.createElement("span");
         value.className = "setting-value";
-        value.textContent = row.kind === "secret" ? row.presence : String(row.value);
+        value.textContent = String(row.value);
         el.append(value);
       }
       section.append(el);
@@ -355,17 +484,67 @@ export function buildChatsScreen(
     section.append(note);
   }
   for (const row of view.rows) {
-    const el = doc.createElement("button");
-    el.type = "button";
+    // A DIV wrapping the controls, not a button that IS the row. A delete
+    // control has to live inside the row it deletes, and a button inside a
+    // button is invalid markup that browsers un-nest -- which puts the delete
+    // control somewhere other than where it was written.
+    const el = doc.createElement("div");
     el.className = `row row-chat row-chat-${row.kind}`;
+    el.dataset["chatId"] = row.id;
+
+    const open = doc.createElement("button");
+    open.type = "button";
+    open.className = "chat-open";
     // A tap on an unreadable row has nowhere useful to go, so only real chats
     // carry the open-chat intent -- intents.ts refuses a missing chatId anyway.
     if (row.kind === "chat") {
-      el.dataset["action"] = "open-chat";
-      el.dataset["chatId"] = row.id;
+      open.dataset["action"] = "open-chat";
+      open.dataset["chatId"] = row.id;
     }
-    el.setAttribute("aria-label", chatRowName(strings, row));
-    el.textContent = row.title;
+    // Title AND when it was last touched, from one string so the visible time
+    // and the spoken time cannot differ. `buildChatList` has computed
+    // `updatedLabel` for every row on every visit since it was written and
+    // nothing rendered it: the list is SORTED by recency and showed none of
+    // it, so two chats called "Untitled" were indistinguishable.
+    open.setAttribute(
+      "aria-label",
+      row.kind === "chat"
+        ? strings.chatUpdated(chatRowName(strings, row), row.updatedLabel)
+        : chatRowName(strings, row),
+    );
+    const title = doc.createElement("span");
+    title.className = "chat-title";
+    title.textContent = row.title;
+    open.append(title);
+    if (row.kind === "chat") {
+      const when = doc.createElement("span");
+      when.className = "chat-updated";
+      when.textContent = row.updatedLabel;
+      open.append(when);
+    }
+    el.append(open);
+
+    if (row.kind === "chat") {
+      // The affordance for `session.remove` -> `repository.remove` ->
+      // `storage.remove`. All three were implemented and contract-tested, the
+      // `delete-chat` intent was decoded and tested, and NOTHING in the app
+      // rendered a control carrying it -- so a conversation, once started,
+      // could never be removed from the device by any sequence of taps.
+      const del = doc.createElement("button");
+      del.type = "button";
+      del.className = "chat-delete";
+      del.dataset["action"] = "delete-chat";
+      del.dataset["chatId"] = row.id;
+      // The title is carried on the button itself, not re-derived from the
+      // row's text: `parentElement.textContent` folds in the title, the
+      // relative time and the button's own word, so arming produced labels
+      // like "Delete Trip plan5m agoConfirm". Held here it stays the clean
+      // name on every rebuild and arming pass.
+      del.dataset["chatTitle"] = row.title;
+      del.textContent = strings.actionDelete;
+      del.setAttribute("aria-label", strings.deleteChat(row.title));
+      el.append(del);
+    }
     section.append(el);
   }
   return section;
@@ -411,14 +590,35 @@ export function stopNotice(stopped: boolean, strings: Strings): string | null {
  * (a re-open paints the same rows, not duplicates) and cannot collide with a
  * live turn's `text:N` ids -- a collision would make the first streamed
  * paragraph update a history row in place instead of appending after it.
+ *
+ * THE ROLE DECIDES THE ROW KIND, and this is the second half of the missing
+ * user message. `StoredMessage.role` has been `"user" | "assistant"` since the
+ * repository was written and this function threw it away, mapping both to a
+ * `text` row -- the kind that means "the model said this". So a reopened
+ * conversation did paint the user's questions, in the assistant's clothes: the
+ * two sides of the conversation were rendered identically, and a screen reader
+ * heard one voice. The prompt is ALREADY on disk, so there is no second source
+ * of truth to invent here -- only a role that had to stop being discarded.
+ *
+ * A stored message is `stored` by definition: it was read back off the disk it
+ * is asking about.
  */
 export function historyRows(messages: readonly StoredMessage[]): readonly Row[] {
-  return messages.map((message, index) => ({
-    kind: "text",
-    id: `history:${index}:${message.role}`,
-    text: message.content,
-    streaming: false,
-  }));
+  return messages.map((message, index) =>
+    message.role === "user"
+      ? {
+          kind: "user",
+          id: `history:${index}:user`,
+          text: message.content,
+          state: "stored",
+        }
+      : {
+          kind: "text",
+          id: `history:${index}:assistant`,
+          text: message.content,
+          streaming: false,
+        },
+  );
 }
 
 /** `createApp`, with a thrown failure turned into the same typed result the
@@ -454,6 +654,20 @@ export async function mount(deps: MountDeps): Promise<App | null> {
   });
 
   const platform = deps.platform ?? detectPlatform();
+
+  /**
+   * The WALL clock, and it comes from the port.
+   *
+   * `TimePort.epochMs` existed, was implemented by the web adapter, was
+   * conformance-tested, and had zero callers anywhere in the application: every
+   * wall-clock read in this file was a bare `Date.now()`, so the seam that is
+   * supposed to make time injectable ran past its own port. The port draws the
+   * distinction in its doc comment -- `nowMs` is monotonic and for elapsed
+   * intervals, `epochMs` is the wall clock and for timestamps -- and "conflating
+   * them is how a clock correction mid-stream makes a coalescer wait forever or
+   * flush every frame".
+   */
+  const nowEpochMs = deps.now ?? ((): number => platform.time.epochMs());
 
   // ---- locale and direction ----------------------------------------------
   // Detected, not the literal "en" this used to hardcode. The English table is
@@ -550,13 +764,109 @@ export async function mount(deps: MountDeps): Promise<App | null> {
   const nodes: RowNodes = emptyNodes();
   let announcer: AnnouncerState = initialAnnouncer;
 
-  // A reopened conversation's stored messages, as reconciler rows. The
-  // controller only ever publishes the CURRENT turn -- it resets to
-  // `initialTurn` on each run -- so history is not in the RunView. It is held
-  // here and PREPENDED to every reconcile, so a follow-up turn's rows land
-  // below it and a reconcile never emits `remove` for history it did not know
-  // about. Empty for a fresh chat; cleared on New chat.
-  let history: readonly Row[] = [];
+  /**
+   * Everything ABOVE the turn now on screen: a reopened conversation's stored
+   * messages, plus every turn this session has already finished.
+   *
+   * The controller only ever publishes the CURRENT turn -- it resets to
+   * `beginTurn(prompt)` on each run -- so neither is in the RunView. Both are
+   * held here and PREPENDED to every reconcile, so a follow-up turn's rows land
+   * below them and a reconcile never emits `remove` for rows it did not know
+   * about. Empty for a fresh chat; cleared on New chat.
+   *
+   * `priorRows`, NOT `history`, and the distinction is worth the longer name.
+   * `history` in this file now means CONVERSATION MEMORY -- the
+   * `ConversationHistory` the in-process engine replays onto a fresh agent
+   * every turn, read from `Session.current()`. This is a list of RENDERED ROWS.
+   * The two are close but not equal, and calling both `history` shadowed one
+   * with the other inside `mount`:
+   *
+   *   - Conversation memory holds only what `record()` actually WROTE. A turn
+   *     that failed was never offered for persistence, so the model is never
+   *     told about it.
+   *   - These rows hold every finished turn, persisted or not, because a
+   *     question you asked and the error that answered it both belong on
+   *     screen -- removing them would hide the failure.
+   *
+   * That divergence is deliberate and it is SAID OUT LOUD rather than left to
+   * be discovered: a turn on screen that is not in the stored conversation
+   * renders its user row as `unstored`, which reads "Not saved -- this message
+   * is not in the stored conversation". `main.test.ts` asserts the agreement in
+   * both directions, so a change that starts feeding the model rows it never
+   * stored -- or drops a stored turn off the screen -- fails by name.
+   */
+  let priorRows: readonly Row[] = [];
+
+  /**
+   * The rows of the turn currently on screen, and the turn they belong to.
+   *
+   * A finished turn used to be ERASED by the next one. The controller publishes
+   * only the current turn, so the moment `runTurn` installed a fresh state the
+   * reconciler saw the previous turn's ids missing from the next row list and
+   * emitted `remove` for every one of them. Measured on main before this
+   * change, with two questions asked in one session: after the second Send the
+   * transcript contained the second answer AND NOTHING ELSE -- the first
+   * question and its reply were gone from a conversation that was still open.
+   *
+   * That is invisible while the transcript has no user rows (one anonymous
+   * paragraph replaces another) and glaring once it has them, which is why it
+   * is fixed here rather than left: a "your message" row that disappears the
+   * next time you speak is not the feature.
+   *
+   * So a turn that has ENDED is moved into `priorRows` when the NEXT one
+   * begins.
+   * Not when it ends: at that moment it is still the live turn, still carrying
+   * its tool cards, its usage and its error row, and moving it early would
+   * either duplicate those rows or drop them at the exact instant the answer
+   * lands.
+   *
+   * Ids are namespaced per turn (`t0:`, `t1:`, ...) from the moment they are
+   * built, not rewritten at promotion time. Two turns both produce `text:0`,
+   * and a shared id is how a keyed renderer paints one row's content into
+   * another row's node. Keying up front also means promotion changes no id at
+   * all, so it emits no ops: the rows already on screen stay exactly where they
+   * are instead of being removed and rebuilt under the user.
+   */
+  let liveRows: readonly Row[] = [];
+  let turnSeq = 0;
+  let turnEnded = false;
+
+  /** A turn's rows, namespaced so no two turns can claim the same id. Both
+   *  turns of a two-turn chat produce `text:0`; see `liveRows`. */
+  const keyed = (rows: readonly Row[], seq: number): readonly Row[] =>
+    rows.map((row) => ({ ...row, id: `t${seq}:${row.id}` }));
+
+  /**
+   * Whether a publish from the controller belongs to the chat now on screen.
+   *
+   * Stopping the previous chat's run on a switch aborts it, but the abort still
+   * drives one FINAL publish (the controller always paints the terminal frame,
+   * see controller.ts) -- and that frame carries the OLD chat's turn. Left
+   * ungated it reconciles the old answer or a "Stopped" row into the transcript
+   * we have just seeded with the NEW chat's history, and it is then promoted
+   * into `priorRows` and reopens there. `setChat` cannot help: by the time the
+   * late publish lands the controller already reports the new chat's id.
+   *
+   * So every chat switch sets this false -- from that point the only publishes
+   * worth painting are for a turn THIS chat issued -- and `submit` sets it true
+   * for the turn it is about to start. A stale terminal publish from the run we
+   * left arrives while false and is dropped; the new chat's own first frame
+   * (`beginTurn`, from inside `send`) arrives after `submit` re-armed it.
+   */
+  let expectingTurn = false;
+
+  /** Forget every turn on screen. Shared by New chat, Open chat and deleting
+   *  the chat that is open, because getting one of the three resets wrong is
+   *  how a previous conversation's rows leak into the next one. */
+  const clearTurns = (): void => {
+    priorRows = [];
+    liveRows = [];
+    turnSeq = 0;
+    turnEnded = false;
+    // A switched-to chat has issued no turn yet, so any publish still arriving
+    // is the run we just left painting its last frame into the wrong chat.
+    expectingTurn = false;
+  };
 
   // ---- composer state (draft, key policy, autosize) ----------------------
   // The composer is data now, not just a <textarea>: a draft that survives a
@@ -582,12 +892,31 @@ export async function mount(deps: MountDeps): Promise<App | null> {
   };
 
   const publish = (view: RunView): void => {
+    // Drop a frame from the run we switched away from. A chat switch stops the
+    // previous run, but the abort still drives one terminal publish carrying
+    // the OLD chat's turn; painting it here reconciles that turn into the chat
+    // we just opened. `expectingTurn` is armed only by the turn THIS chat
+    // issued (see `submit`), so an idle, cleared chat drops the straggler and
+    // stays empty. See `expectingTurn`.
+    if (!expectingTurn) return;
+
+    // A new turn has begun and the previous one had ended: keep it. See
+    // `liveRows` -- without this the answer above is removed by the very
+    // reconcile that draws the new question.
+    if (turnEnded && view.turn.phase !== "ended") {
+      priorRows = [...priorRows, ...liveRows];
+      turnSeq += 1;
+    }
+    turnEnded = view.turn.phase === "ended";
+
     const built = buildTranscript(view.turn, view.approvals);
-    // History first, then the live turn. `history` is empty for a fresh chat,
-    // so this is a no-op there; for a reopened chat it keeps the restored
-    // conversation ABOVE the turn now streaming and inside the render state, so
-    // the diff updates the live rows without removing the history.
-    const rows = history.length === 0 ? built.rows : [...history, ...built.rows];
+    liveRows = keyed(built.rows, turnSeq);
+    // Prior rows first, then the live turn. `priorRows` is empty for a fresh chat
+    // that has not finished a turn yet, so this is a no-op there; otherwise it
+    // keeps the restored conversation and every completed turn ABOVE the turn
+    // now streaming and inside the render state, so the diff updates the live
+    // rows without removing what is above them.
+    const rows = priorRows.length === 0 ? liveRows : [...priorRows, ...liveRows];
     const diff = reconcile(render, rows);
     applyOps(transcript, nodes, diff.ops, strings);
     render = diff.next;
@@ -598,7 +927,14 @@ export async function mount(deps: MountDeps): Promise<App | null> {
       turn: view.turn,
       strings,
       locale: activeLocale,
-      nowMs: Date.now(),
+      // MONOTONIC, not the wall clock. `announce` compares
+      // `nowMs - lastStreamAtMs` against its rate-limit interval, and a
+      // `Date.now()` there is exactly the conflation `core/src/ports/time.ts`
+      // is written against: an NTP correction that moves the clock backwards
+      // mid-answer silences every further streaming announcement until real
+      // time catches up with the pre-correction reading, so a screen-reader
+      // user simply stops being told what the model is saying.
+      nowMs: platform.time.nowMs(),
     });
     announcer = spoken.state;
     // Each region is assigned ONCE, with every utterance of that politeness
@@ -654,11 +990,21 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     // them. This used to be a stub whose `get` returned undefined, captured by
     // the engine at boot and never replaced -- so the engine address the user
     // set was read, stored, and thrown away in favour of the hardcoded default.
-    engines: (persistence, settings, onIgnored) =>
+    engines: (persistence, history, settings, onIgnored) =>
       appEngines({
         settings,
         http: platform.http,
+        // The FULL port, straight from the platform. `createApp` hands this
+        // factory the settings FACADE, which deliberately cannot read a
+        // secret; the engine needs the value, so it gets the port here, in
+        // the one file allowed to name a concrete adapter.
+        secrets: platform.secrets,
         persistence,
+        // Read side and write side, both from the session `createApp` just
+        // built. A turn is recorded through one and replayed through the
+        // other, so the model's memory and the transcript on screen cannot
+        // drift apart.
+        history,
         onIgnored,
         ...(deps.loadAgent === undefined ? {} : { loadAgent: deps.loadAgent }),
       }),
@@ -673,7 +1019,7 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     // first launch. registry.ts says why desktop Tauri counts as a device.
     engineId: defaultEngineIdFor(platform.kind),
     onPublish: publish,
-    now: deps.now ?? (() => Date.now()),
+    now: nowEpochMs,
     newChatId: mintChatId,
   });
 
@@ -720,7 +1066,32 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     layout = withKeyboard(layout, platform.shell.keyboardHeightPx);
     const geometry = geometryOf(layout);
     screen.style.setProperty("--keyboard-height", `${geometry.composerBottomPx}px`);
-    screen.style.setProperty("--inset-top", `${geometry.scrollTopPx}px`);
+    // The four EFFECTIVE insets, on the container every screen lives in.
+    //
+    // app.css declares `--inset-*` as `var(--safe-area-inset-*)` so the first
+    // paint has something, and every layout rule consumes `--inset-*` rather
+    // than the env() mirror. This is why: on Android `env(safe-area-inset-*)`
+    // is the DISPLAY CUTOUT and nothing else -- measured on an Android 15
+    // emulator with no cutout configured, `--safe-area-inset-top` was 0px
+    // against a 24px status bar and 24px navigation bar, and the topbar's title
+    // was painted straight through the clock. `shell.insets` is the OS's own
+    // numbers (MainActivity.kt feeds them in through the bridge in
+    // adapters/src/tauri/shell.ts), so writing them here is what makes the
+    // stylesheet see a status bar at all.
+    //
+    // Written on `root`, not on `screen`: settings and chats are SIBLINGS of
+    // the chat screen, so anything set on `screen` never reaches them -- which
+    // is the shape the original `--inset-top` had, and it was consumed by no
+    // rule at all.
+    //
+    // The env() mirror is deliberately NOT overwritten. It is what
+    // `readInsets` reads, and writing our own value back into the variable we
+    // read from would make the shell echo itself instead of the device.
+    const insets = layout.insets;
+    root.style.setProperty("--inset-top", `${insets.top}px`);
+    root.style.setProperty("--inset-right", `${insets.right}px`);
+    root.style.setProperty("--inset-bottom", `${insets.bottom}px`);
+    root.style.setProperty("--inset-left", `${insets.left}px`);
     const logical = logicalInsets(bundle.direction, geometry.composerLeftPx, geometry.composerRightPx);
     // The GUTTER is added here, not left to the stylesheet. An inline style
     // beats `app.css`'s `calc(var(--safe-area-inset-left) + .75rem)`, so
@@ -734,46 +1105,156 @@ export async function mount(deps: MountDeps): Promise<App | null> {
   platform.shell.onInsetsChanged(applyGeometry);
   platform.shell.onKeyboardHeightChanged(applyGeometry);
 
+  /** Every element under `scope`, including `scope` itself. The same walk
+   *  `syncSettings` and `byFocusId` do: there is no `querySelectorAll` in the
+   *  seam a test drives, and the tree is a settings screen, not a document. */
+  const everyElement = (scope: HTMLElement): readonly HTMLElement[] => {
+    const found: HTMLElement[] = [];
+    const stack: HTMLElement[] = [scope];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (node === undefined) break;
+      found.push(node);
+      for (const child of node.children) {
+        if (child instanceof HTMLElement) stack.push(child);
+      }
+    }
+    return found;
+  };
+
+  /**
+   * Put a secret row back the way it must always look: field EMPTY, and the
+   * refusal for this key shown or cleared.
+   *
+   * Emptying is the point, and it is not cosmetic. `syncSettings` redraws a
+   * plain field from the store, which is the honest thing for an engine
+   * address; the mirror of that for a secret would mean reading it back, and
+   * there is deliberately nothing to read it back WITH. So the field returns
+   * to empty -- the value the user pasted lives in the keychain and stops
+   * existing in the DOM, where the next screenshot, crash report or
+   * accessibility dump would otherwise find it.
+   */
+  const syncSecret = (key: string, refusal: string | null): void => {
+    for (const node of everyElement(root)) {
+      if (node.dataset["action"] === "set-secret" && node.dataset["settingKey"] === key) {
+        (node as HTMLElement & { value: string }).value = "";
+        continue;
+      }
+      if (node.dataset["settingError"] !== key) continue;
+      node.textContent = refusal ?? "";
+      node.hidden = refusal === null;
+    }
+  };
+
+  /**
+   * Resolve `hasSecret` for every secret def and write the answer into the
+   * row's presence node.
+   *
+   * PRESENCE, not the value: `hasSecret` is the method that exists so a screen
+   * can say "Configured" without faulting a key into memory (ports/secrets.ts
+   * rule 2), and this is the only place the app asks.
+   *
+   * Async and separate from the paint because `buildSettings` is synchronous
+   * and a keychain lookup is not. Writing into an existing node rather than
+   * rebuilding the screen is what keeps a half-pasted key in the field when
+   * the answer lands a moment later.
+   */
+  // Which presence lookup is the most recent one asked for. A save followed by
+  // a Remove fires two overlapping walks, and with a native keychain adapter
+  // (the declared next step) `hasSecret` can resolve OUT OF ORDER -- the older
+  // lookup landing last would paint "Configured" over a row the user just
+  // cleared, or "Not set" over one they just saved. Only the latest request is
+  // allowed to write; a stale one has already been superseded and is dropped.
+  let latestPresenceSeq = 0;
+  const refreshSecretPresence = (scope: HTMLElement): void => {
+    const seq = ++latestPresenceSeq;
+    void (async (): Promise<void> => {
+      const answers = new Map<string, string>();
+      for (const def of app.settings.defs()) {
+        const ref = secretRefOf(def);
+        if (ref === null) continue;
+        answers.set(def.key, presenceLabel((await app.settings.hasSecret(ref)) ? "configured" : "not-set"));
+      }
+      // A newer refresh started while this one awaited: its answer is the
+      // current truth, so this one must not overwrite it.
+      if (seq !== latestPresenceSeq) return;
+      for (const node of everyElement(scope)) {
+        const key = node.dataset["secretPresence"];
+        if (key === undefined) continue;
+        const label = answers.get(key);
+        if (label !== undefined) node.textContent = label;
+      }
+    })().catch(() => {
+      // A keychain that will not answer leaves the row at UNKNOWN, which is
+      // what it already says. Overwriting it with "Not set" would tell someone
+      // their key is gone because a lookup failed -- view-model.ts rule 2, and
+      // the reason UNKNOWN is a state at all. A floating rejection here would
+      // also reach the global crash handler and replace the whole app.
+    });
+  };
+
   // ---- screens the router drives -----------------------------------------
   // The chat screen is retained (it holds scroll position and a live stream);
   // settings and chats are built on demand and rebuilt each visit. `transition`
   // decides what to mount, hide and destroy; this half only obeys it.
+  /**
+   * Redraw a chats section from storage, in place.
+   *
+   * Extracted from the `build` callback because a DELETE has to refresh a list
+   * that is already on screen: the chats screen is rebuilt on each VISIT, and
+   * deleting a row is not a visit. Rebuilding through the same function is
+   * what keeps "the row is gone" and "the list is now empty" the same
+   * rendering -- removing the node by hand would leave a list showing nothing
+   * where `chatsEmpty` belongs.
+   */
+  const refreshChats = async (section: HTMLElement): Promise<void> => {
+    try {
+      const [summaries, unreadable] = await Promise.all([
+        app.session.list(),
+        app.session.repository.listUnreadable(),
+      ]);
+      const fresh = buildChatsScreen(
+        doc,
+        summaries as readonly ChatSummary[],
+        unreadable,
+        nowEpochMs(),
+        strings,
+      );
+      section.textContent = "";
+      for (const child of [...fresh.children]) section.append(child as HTMLElement);
+    } catch {
+      // Storage can reject while the list loads -- SecurityError with site
+      // data blocked, QuotaExceededError. A floating rejection here reaches
+      // the global crash handler and replaces the WHOLE app with the fatal
+      // screen; a failed chat list must stay a LOCAL failure, so the user
+      // can go back and keep using the conversation they are in.
+      section.textContent = "";
+      const notice = doc.createElement("p");
+      notice.className = "row row-notice";
+      notice.dataset["tone"] = "warning";
+      notice.setAttribute("role", "alert");
+      notice.textContent = strings.crashed;
+      section.append(notice);
+    }
+  };
+
   const screens = createScreens({
     root,
     build: (id: ScreenId): HTMLElement => {
-      if (id === "settings") return buildSettingsScreen(doc, app.settings, strings);
+      if (id === "settings") {
+        const section = buildSettingsScreen(doc, app.settings, strings);
+        // Built with presence UNKNOWN, then filled in. The alternative --
+        // awaiting the keychain before painting -- is a blank screen for as
+        // long as the platform takes to answer, and `build` is synchronous
+        // because `transition` is.
+        refreshSecretPresence(section);
+        return section;
+      }
       if (id === "chats") {
         // A fresh snapshot each visit: a chat created since the list was last
         // seen must appear, and one deleted must be gone.
-        const section = buildChatsScreen(doc, [], [], deps.now?.() ?? Date.now(), strings);
-        void (async (): Promise<void> => {
-          const [summaries, unreadable] = await Promise.all([
-            app.session.list(),
-            app.session.repository.listUnreadable(),
-          ]);
-          const fresh = buildChatsScreen(
-            doc,
-            summaries as readonly ChatSummary[],
-            unreadable,
-            deps.now?.() ?? Date.now(),
-            strings,
-          );
-          section.textContent = "";
-          for (const child of [...fresh.children]) section.append(child as HTMLElement);
-        })().catch(() => {
-          // Storage can reject while the list loads -- SecurityError with site
-          // data blocked, QuotaExceededError. A floating rejection here reaches
-          // the global crash handler and replaces the WHOLE app with the fatal
-          // screen; a failed chat list must stay a LOCAL failure, so the user
-          // can go back and keep using the conversation they are in.
-          section.textContent = "";
-          const notice = doc.createElement("p");
-          notice.className = "row row-notice";
-          notice.dataset["tone"] = "warning";
-          notice.setAttribute("role", "alert");
-          notice.textContent = strings.crashed;
-          section.append(notice);
-        });
+        const section = buildChatsScreen(doc, [], [], nowEpochMs(), strings);
+        void refreshChats(section);
         return section;
       }
       // "about" and "chat" have no builder here: chat is the pre-built root
@@ -808,6 +1289,19 @@ export async function mount(deps: MountDeps): Promise<App | null> {
   // the settings button -- so the user lands where they were, not at the top of
   // a list they have to scroll down again.
   let restoreFocus: HTMLElement | null = null;
+
+  /**
+   * The chat whose delete control is ARMED, or null.
+   *
+   * Deleting a conversation is the only irreversible thing in this app, and a
+   * chat row's delete button sits a few millimetres from the row that opens
+   * it, on a touch screen. So the first tap arms and the second deletes.
+   *
+   * Held by chat id rather than by element, for the same reason `syncSettings`
+   * walks: the chats screen is rebuilt on every visit, so any element held
+   * across a navigation is detached.
+   */
+  let armedDelete: string | null = null;
 
   // The three lines focus.ts deliberately does NOT do -- move focus, save it,
   // restore it -- because they are the only part it cannot unit test. Doing
@@ -848,6 +1342,11 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     // focus on the screen the user just left, or on <body> once that screen was
     // hidden -- exactly the failure focus.ts's ids exist to fix.
     applyFocus(focus);
+    // Leaving the list disarms it. A delete armed before a navigation and
+    // still armed on the way back would turn the FIRST tap after returning
+    // into a deletion, with nothing on screen saying so -- the two-tap guard
+    // silently spending itself while the user was elsewhere.
+    armedDelete = null;
     currentRoute = route;
   };
   // The router's root is `chats`, but the app opens on the chat screen; align
@@ -942,6 +1441,29 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     }
   };
 
+  /** Put every delete control in step with `armedDelete`. */
+  const syncDeleteArming = (): void => {
+    const stack: HTMLElement[] = [root];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (node === undefined) break;
+      for (const child of node.children) {
+        if (child instanceof HTMLElement) stack.push(child);
+      }
+      if (node.dataset["action"] !== "delete-chat") continue;
+      const id = node.dataset["chatId"] ?? "";
+      // The clean title is carried on the button's own dataset, set when the
+      // row was built. Reading `parentElement.textContent` instead folded in
+      // the visible time and the button's own word ("Delete Trip plan5m
+      // agoConfirm"); the dataset holds the name the row was rendered with.
+      const title = node.dataset["chatTitle"] ?? id;
+      const armed = id !== "" && id === armedDelete;
+      node.textContent = armed ? strings.actionConfirmDelete : strings.actionDelete;
+      node.setAttribute("aria-label", armed ? strings.deleteChatConfirm(title) : strings.deleteChat(title));
+      node.dataset["armed"] = armed ? "true" : "false";
+    }
+  };
+
   const perform = async (intent: Intent): Promise<void> => {
     switch (intent.kind) {
       case "send":
@@ -967,8 +1489,9 @@ export async function mount(deps: MountDeps): Promise<App | null> {
         // the same id".
         app.controller.setChat(mintChatId());
         app.session.reset();
-        // A fresh chat has no history to keep above the next turn.
-        history = [];
+        // A fresh chat has no history to keep above the next turn, and no
+        // finished turn to promote into it.
+        clearTurns();
         render = emptyRender;
         nodes.nodes.clear();
         announcer = initialAnnouncer;
@@ -1017,12 +1540,144 @@ export async function mount(deps: MountDeps): Promise<App | null> {
         syncSettings(intent.key, refusal);
         return;
       }
+      case "delete-chat": {
+        // `session.remove` -> `repository.remove` -> `storage.remove`: three
+        // implemented, contract-tested methods with no caller in the app, and
+        // an intent `intents.ts` decoded for a control nothing rendered. A
+        // conversation, once started, could not be removed from the device.
+        //
+        // The title is a nicety for the announcement; `session.list` reads
+        // StoragePort, which REJECTS on a real device (SecurityError with site
+        // data blocked, QuotaExceededError). These reads sit OUTSIDE the remove
+        // try below, and `perform` is invoked through a floating `void`, so a
+        // rejection here floats to the global crash handler and replaces the
+        // whole app with the fatal screen for a lookup that only decides a
+        // label. Degrade to the id rather than crash.
+        const titleOf = async (): Promise<string> => {
+          try {
+            return (
+              (await app.session.list()).find((c) => c.id === intent.chatId)?.title ??
+              intent.chatId
+            );
+          } catch {
+            return intent.chatId;
+          }
+        };
+        // Arm first. The second tap on the SAME row is the one that deletes;
+        // a tap on a different row moves the arming rather than deleting two.
+        if (armedDelete !== intent.chatId) {
+          armedDelete = intent.chatId;
+          syncDeleteArming();
+          assertive.textContent = strings.deleteChatConfirm(await titleOf());
+          return;
+        }
+        const title = await titleOf();
+        armedDelete = null;
+        // Read BEFORE the remove. `session.remove` clears `current` itself
+        // when it deletes the open chat, so asking afterwards always answers
+        // null and the transcript is left on screen -- a conversation the user
+        // can keep typing into that no longer exists on disk.
+        const wasOpen = app.session.current()?.id === intent.chatId;
+        try {
+          await app.session.remove(intent.chatId);
+        } catch {
+          // StoragePort rejects on a real device. Left to float this reaches
+          // the crash handler and replaces the whole app; and a delete that
+          // silently did nothing leaves the user believing it worked.
+          assertive.textContent = strings.chatDeleteFailed;
+          syncDeleteArming();
+          return;
+        }
+        // The conversation on screen may be the one just deleted. Leaving it
+        // there is a transcript the user can keep typing into that no longer
+        // exists on disk -- the next turn would silently re-create it.
+        if (wasOpen) {
+          void app.controller.stop();
+          app.controller.setChat(mintChatId());
+          app.session.reset();
+          clearTurns();
+          render = emptyRender;
+          nodes.nodes.clear();
+          announcer = initialAnnouncer;
+          transcript.textContent = "";
+          polite.textContent = "";
+        }
+        assertive.textContent = strings.chatDeleted(title);
+        const list = screens.nodes.get("chats");
+        if (list !== undefined) await refreshChats(list);
+        return;
+      }
+      case "set-secret": {
+        // The def comes from the LIVE facade for the same reason `set-setting`
+        // does: the screen and the registry must not be able to disagree about
+        // which key this field belongs to.
+        const def = app.settings.defs().find((d) => d.key === intent.key);
+        if (def === undefined) return;
+        // `secretRefOf` refuses a def that is not a secret, and a secret def
+        // with nowhere to write. Either would otherwise end with a pasted key
+        // going somewhere nobody chose.
+        const ref = secretRefOf(def);
+        let stored = false;
+        if (ref !== null) {
+          try {
+            // Trimmed: a key pasted from a mail client or a terminal arrives
+            // with a trailing newline, and an `Authorization` header built
+            // from it fails with an error about the key rather than about the
+            // whitespace. No provider key contains one.
+            await app.settings.setSecret(ref, intent.raw.trim());
+            stored = true;
+          } catch {
+            // SecretsPort rejects on a real device -- a locked keychain, a
+            // keystore that will not open. Left to float this reaches the
+            // global crash handler and replaces the WHOLE app with the fatal
+            // screen, on the one screen the user is trying to repair.
+            stored = false;
+          }
+        }
+        const refusal = stored ? null : strings.settingRejected(labelOf(def));
+        // The LABEL, never the value: this is an assertive live region and it
+        // is read out loud.
+        assertive.textContent = stored ? strings.secretStored(labelOf(def)) : (refusal ?? "");
+        syncSecret(intent.key, refusal);
+        // Presence has changed; ask again rather than assuming. `setSecret`
+        // resolving is not proof the store kept it.
+        refreshSecretPresence(root);
+        return;
+      }
+      case "clear-secret": {
+        const def = app.settings.defs().find((d) => d.key === intent.key);
+        if (def === undefined) return;
+        const ref = secretRefOf(def);
+        let cleared = false;
+        if (ref !== null) {
+          try {
+            await app.settings.clearSecret(ref);
+            cleared = true;
+          } catch {
+            cleared = false;
+          }
+        }
+        const refusal = cleared ? null : strings.settingRejected(labelOf(def));
+        assertive.textContent = cleared ? strings.secretCleared(labelOf(def)) : (refusal ?? "");
+        syncSecret(intent.key, refusal);
+        refreshSecretPresence(root);
+        return;
+      }
       case "open-chat": {
         // Reopen a previous conversation. `session.list()` had no app caller and
         // `session.open()` no way to be reached; this is the path from the chat
         // list back into a stored transcript.
         const opened = await app.session.open(intent.chatId);
         if (!opened) return;
+        // Stop the previous chat's run FIRST, exactly as New chat and deleting
+        // the open chat already do. Without this, a run still in flight from the
+        // conversation being left keeps streaming, and its terminal `publish()`
+        // reconciles the old chat's answer or error row into the transcript we
+        // are about to seed with THIS chat's history -- where it is then promoted
+        // into `priorRows` and reopens with the wrong conversation. `setChat`
+        // clears the controller's turn, but it cannot cancel a run the engine is
+        // still driving; only `stop()` does.
+        void app.controller.stop();
         app.controller.setChat(intent.chatId);
         render = emptyRender;
         nodes.nodes.clear();
@@ -1041,8 +1696,12 @@ export async function mount(deps: MountDeps): Promise<App | null> {
         // `publish` keeps it in the same coordinate system the stream appends to
         // AND makes it survive the next turn's reconcile.
         const chat = app.session.current();
-        history = chat === null ? [] : historyRows(chat.messages);
-        const seeded = reconcile(render, history);
+        // The turns of the PREVIOUS conversation go with it -- including one
+        // that is mid-flight. Reopening a chat into another chat's rows is the
+        // same leak `setChat` was added for, one layer up.
+        clearTurns();
+        priorRows = chat === null ? [] : historyRows(chat.messages);
+        const seeded = reconcile(render, priorRows);
         applyOps(transcript, nodes, seeded.ops, strings);
         render = seeded.next;
         app.router.push({ name: "chat", chatId: intent.chatId });
@@ -1066,6 +1725,11 @@ export async function mount(deps: MountDeps): Promise<App | null> {
     input.value = "";
     syncComposer();
     if (result.sent === null) return; // refused while a turn is in flight
+    // Arm the transcript for THIS chat's own turn. A switch left `expectingTurn`
+    // false so a straggling publish from the run we left is dropped; issuing a
+    // run here is the moment publishes become ours to paint again. Set before
+    // `send`, which publishes `beginTurn` synchronously on the way in.
+    expectingTurn = true;
     await app.controller.send(result.sent);
   };
 

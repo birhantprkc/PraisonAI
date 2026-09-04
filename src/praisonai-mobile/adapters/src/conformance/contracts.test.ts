@@ -13,7 +13,7 @@
  */
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
@@ -36,8 +36,10 @@ import {
   preparedStorage,
 } from "../storage/migrate.ts";
 import { createWebSecrets } from "../web/secrets.ts";
+import { createTauriSecrets, SECRET_COMMANDS } from "../tauri/secrets.ts";
 import { createWebTime } from "../web/time.ts";
 import { createFakeSecrets } from "../../../testing/src/fake-secrets.ts";
+import type { SecretsPort } from "../../../core/src/ports/secrets.ts";
 import { createFakeTime } from "../../../testing/src/fake-time.ts";
 import { createWebShell } from "../web/shell.ts";
 import { INSET_VARIABLES } from "../../../core/src/ports/shell.ts";
@@ -180,8 +182,111 @@ function nativeHost(files: Map<string, string>): StrictInvoke {
 // The SecretsPort had no contract and no test of any kind. Collapsing the web
 // adapter's key from `${slot}:${account}` to `${slot}` survived the whole
 // suite -- two accounts in one slot then share one credential.
-describeSecretsContract("fake secrets", () => createFakeSecrets());
+//
+// The fake gets the PRESENCE branch (it counts reads); neither it nor the web
+// adapter gets the durability branch, because neither claims it -- both are a
+// module-scoped Map on purpose.
+describeSecretsContract(
+  "fake secrets",
+  () => createFakeSecrets(),
+  undefined,
+  (port) => (port as ReturnType<typeof createFakeSecrets>).reads,
+);
 describeSecretsContract("web secrets", () => createWebSecrets());
+
+// ---- the Tauri adapter, against a stand-in for the Rust commands ----------
+//
+// What this proves and what it does not. It proves the ADAPTER: that it invokes
+// the four command names `src-tauri/src/secrets.rs` declares, with the argument
+// names the Rust parameters are called; that it keeps slots and accounts apart;
+// that it turns a reply into the port's own vocabulary; that `has` goes to the
+// PRESENCE command and never to the read one; and that a key written before a
+// "relaunch" is still there afterwards. It does NOT prove that the Keychain or
+// the Keystore is hardware backed -- `src-tauri/plugins/secrets` is where the
+// Apple half is tested against the real keychain, the Android half is proved on
+// a device, and `tools/secrets-seam.test.mjs` is what stops the two sides
+// drifting apart on a name.
+//
+// The host is STRICT: an unknown command or a missing argument throws rather
+// than resolving to null. A forgiving stand-in would let the adapter send
+// `slotName` to a command expecting `slot` and stay green, which on a device is
+// every secret call failing with nothing pointing at the cause.
+interface KeychainHost {
+  readonly invoke: StrictInvoke;
+  /** How many times the adapter asked for a VALUE. */
+  reads(): number;
+}
+
+function keychainHost(items: Map<string, string>): KeychainHost {
+  let reads = 0;
+  const need = (args: Record<string, unknown> | undefined, name: string): string => {
+    const value = args?.[name];
+    if (typeof value !== "string") throw new Error(`missing string argument "${name}"`);
+    return value;
+  };
+  // The Rust side composes `service_for(slot)` + account; the shape that
+  // matters out here is only that the PAIR is the identity.
+  const at = (args: Record<string, unknown> | undefined): string =>
+    `${need(args, "slot")}\u0000${need(args, "account")}`;
+
+  return {
+    reads: () => reads,
+    invoke: async (command, args) => {
+      switch (command) {
+        case SECRET_COMMANDS.read: {
+          reads += 1;
+          return items.get(at(args)) ?? null;
+        }
+        case SECRET_COMMANDS.has:
+          return items.has(at(args));
+        case SECRET_COMMANDS.write: {
+          items.set(at(args), need(args, "value"));
+          return null;
+        }
+        case SECRET_COMMANDS.remove: {
+          items.delete(at(args));
+          return null;
+        }
+        default:
+          throw new Error(`no such command: ${command}`);
+      }
+    },
+  };
+}
+
+{
+  const hosts = new WeakMap<SecretsPort, KeychainHost>();
+  // The items each port was opened over, so a "relaunch" is a new adapter over
+  // the same keychain rather than the same object handed back -- which would
+  // make every durability case vacuous.
+  const backings = new WeakMap<SecretsPort, Map<string, string>>();
+
+  const openKeychain = (items: Map<string, string>): SecretsPort => {
+    const host = keychainHost(items);
+    const port = createTauriSecrets({ invoke: host.invoke });
+    hosts.set(port, host);
+    backings.set(port, items);
+    return port;
+  };
+
+  describeSecretsContract(
+    "tauri secrets",
+    () => openKeychain(new Map()),
+    // A relaunch: a brand new adapter over a keychain that outlived it. On a
+    // device the keychain is not in the process at all, which is the whole
+    // point -- see src-tauri/plugins/secrets.
+    (previous) => {
+      const items = backings.get(previous);
+      assert.ok(items, "reopen was handed a port this registration did not build");
+      return openKeychain(items);
+    },
+    (port) => {
+      const host = hosts.get(port);
+      assert.ok(host, "reads was handed a port this registration did not build");
+      return host.reads();
+    },
+  );
+}
 
 // The TimePort had no test file and no contract, and scored 3 of 3 surviving
 // in a mutation sweep -- the worst module in the package. Both implementations
@@ -1195,23 +1300,36 @@ function adapterChildEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function runAdapterFixture(mode: string): { status: number | null; output: string } {
-  const here = dirname(fileURLToPath(import.meta.url));
+const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "contract-fixture.ts");
+
+/** Spawn one fixture FILE in one break mode. Takes the path rather than
+ *  assuming `contract-fixture.ts`, because the ledger probe below runs a
+ *  generated copy of it beside the original. */
+function runAdapterFixtureAt(file: string, mode: string): { status: number | null; output: string } {
   // The reporter is FORCED: node 22 emits TAP when stdout is a pipe, node 24
   // emits the spec reporter, and a test grepping for "not ok" would pass on
   // one and fail on the other with identical code under it.
   const run = spawnSync(
     process.execPath,
-    ["--test-reporter=tap", join(here, "contract-fixture.ts"), mode],
+    ["--test-reporter=tap", file, mode],
     { encoding: "utf8", timeout: 120_000, env: adapterChildEnv() },
   );
   return { status: run.status, output: `${run.stdout ?? ""}${run.stderr ?? ""}` };
+}
+
+function runAdapterFixture(mode: string): { status: number | null; output: string } {
+  return runAdapterFixtureAt(FIXTURE, mode);
 }
 
 /** Each break mode, and the contract case that must go red because of it. */
 const ADAPTER_BREAKS: readonly { readonly mode: string; readonly expects: RegExp }[] = [
   { mode: "secrets_slot_only", expects: /two ACCOUNTS in one slot are two different secrets/ },
   { mode: "secrets_empty_is_absent", expects: /an empty string is a stored value, not an absence/ },
+  // The three that this change's own gates rest on. Each one is a way the
+  // native keychain could be wrong while every other case stays green.
+  { mode: "secrets_forgets_on_relaunch", expects: /a stored secret survives a relaunch/ },
+  { mode: "secrets_one_store_for_all", expects: /a FRESH store has none of another store's secrets/ },
+  { mode: "secrets_has_reads_the_value", expects: /has\(\) answers without reading the value/ },
   { mode: "storage_missing_is_undefined", expects: /a missing key reads as null, never undefined/ },
   { mode: "storage_namespaces_collide", expects: /namespaces are isolated/ },
   { mode: "time_every_fires_once", expects: /every\(\) repeats, rather than firing once/ },
@@ -1279,7 +1397,9 @@ test("a contract cannot quietly shrink", () => {
   const casesFor = (prefix: string): number =>
     passed.filter((line) => line.includes(`fixture ${prefix}:`)).length;
 
-  assert.ok(casesFor("secrets") >= 9, `the secrets contract shrank to ${casesFor("secrets")} cases`);
+  // 14, not 9: the fixture now registers with a reopen and a read counter, so
+  // the four durability cases and the presence case run there too.
+  assert.ok(casesFor("secrets") >= 14, `the secrets contract shrank to ${casesFor("secrets")} cases`);
   assert.ok(casesFor("storage") >= 15, `the storage contract shrank to ${casesFor("storage")} cases`);
   assert.ok(casesFor("time") >= 8, `the time contract shrank to ${casesFor("time")} cases`);
   assert.ok(casesFor("shell") >= 37, `the shell contract shrank to ${casesFor("shell")} cases`);
@@ -1288,7 +1408,7 @@ test("a contract cannot quietly shrink", () => {
   // ADAPTER_BREAKS, or lowering a count above, removes a defence and the only
   // signal is a smaller number that nothing reads. Guarding the guard.
   assert.ok(
-    ADAPTER_BREAKS.length >= 15,
+    ADAPTER_BREAKS.length >= 18,
     `the break table shrank to ${ADAPTER_BREAKS.length} modes`,
   );
 });
@@ -1654,15 +1774,32 @@ test("a back gesture the app DECLINES does not touch history", () => {
 // red ON THE LEDGER. Same argument contract-fixture.ts makes, aimed one level
 // up.
 //
-// The contract file is edited in place and restored in a `finally`, rather
-// than copied to a probe module. Two alternatives were tried and rejected: a
-// temp tree breaks the contracts' relative `../../../core` imports, so a
-// "failure" would prove only that the file did not load; and a dynamic
-// `import()` of a probe module needs top-level await, which the boundary
-// scanner's esbuild pass (iife) refuses -- and loosening a gate to make a test
-// of a gate work is the wrong direction. Nothing but this file and the spawned
-// fixture imports a contract, and both have already resolved theirs by the
-// time this runs.
+// THE HOLLOWED CONTRACT IS A COPY, AND THE ORIGINAL IS NEVER WRITTEN TO.
+//
+// It used to edit each `*-contract.ts` in place and restore it in a `finally`,
+// with the invariant stated here that "Nothing but this file and the spawned
+// fixture imports a contract". That invariant holds TODAY -- exactly two
+// importers, verified -- but nothing enforced it, and the technique was copied
+// from engines/src/conformance.test.ts, where it was already false: there the
+// contract had four importers and two of them were sibling `.test.ts` files,
+// so `node --test`, which runs test FILES in separate CONCURRENT processes,
+// would let a sibling import the contract inside the write/restore window and
+// load it with one assertion spliced out while its own ledger still expected
+// the full count. That turned CI red on `check (node 22.18)` while node 24
+// passed on identical code (PR #4792): the node version only decided who lost
+// the race. One new importer of any contract here would reintroduce exactly
+// that, in an unrelated suite, with a stack trace pointing at the wrong line.
+//
+// So the same fix is ported: the hollowed contract is written BESIDE the
+// original under a pid-tagged name, with a copy of the fixture whose one
+// import of that contract is repointed at it. A sibling copy resolves every
+// relative `../../../core` specifier identically -- which a temp tree does not,
+// so a "failure" there would prove only that the module never loaded -- and
+// the real file is never touched, so a concurrent sibling always sees the
+// intact contract. Both copies are removed in a `finally`, and the pid in the
+// name keeps two runs over one checkout from colliding. The original is
+// asserted untouched, so an edit that reverts to in-place writing fails HERE
+// rather than in a sibling suite three files away.
 
 const LEDGERED = ["secrets", "storage", "time", "shell"] as const;
 
@@ -1678,17 +1815,48 @@ function hollowed(source: string): { text: string; removed: string } {
 
 for (const which of LEDGERED) {
   test(`the ${which} contract's assertion ledger notices a deleted assertion`, () => {
-    const file = join(dirname(fileURLToPath(import.meta.url)), `${which}-contract.ts`);
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const file = join(dir, `${which}-contract.ts`);
     const original = readFileSync(file, "utf8");
     const { text, removed } = hollowed(original);
+    // A splice that removed nothing would spawn a child against an intact
+    // contract, which passes -- and the probe would then report "left the run
+    // green", blaming the ledger for its own no-op.
+    assert.notEqual(text, original, "the hollowed copy must actually be missing a line");
+
+    const tag = `probe-${process.pid}-${Date.now().toString(36)}`;
+    const contractCopy = join(dir, `${which}-contract.${tag}.ts`);
+    const fixtureCopy = join(dir, `contract-fixture.${tag}.ts`);
+
+    const fixtureSource = readFileSync(FIXTURE, "utf8");
+    const specifier = `from "./${which}-contract.ts"`;
+    // Asserted, not assumed. If the fixture's import is ever spelled
+    // differently the rewrite silently does nothing, the copy imports the REAL
+    // contract, and the probe passes for the wrong reason -- the exact class of
+    // defect the ledger exists to catch.
+    assert.ok(
+      fixtureSource.includes(specifier),
+      `the fixture must import the ${which} contract to be repointed`,
+    );
+    const repointed = fixtureSource.replace(specifier, `from "./${which}-contract.${tag}.ts"`);
+
     let run: { status: number | null; output: string };
     try {
-      writeFileSync(file, text);
-      run = runAdapterFixture("none");
+      writeFileSync(contractCopy, text);
+      writeFileSync(fixtureCopy, repointed);
+      run = runAdapterFixtureAt(fixtureCopy, "none");
     } finally {
-      writeFileSync(file, original);
+      rmSync(contractCopy, { force: true });
+      rmSync(fixtureCopy, { force: true });
     }
-    assert.equal(readFileSync(file, "utf8"), original, "the contract must be restored byte for byte");
+    // The real contract is untouched -- and stays asserted, so a future edit
+    // that goes back to writing this file in place fails here rather than in a
+    // sibling suite three files away.
+    assert.equal(
+      readFileSync(file, "utf8"),
+      original,
+      "the probe must never write to the real contract",
+    );
     assert.notEqual(
       run.status,
       0,
