@@ -1,6 +1,6 @@
 # Feature Parity Tracker
 
-> **Version:** 1.5.87 | **Last Updated:** 2026-09-03
+> **Version:** 1.5.87 | **Last Updated:** 2026-09-07
 > **Source of Truth:** Python SDK (praisonaiagents)
 
 > [!IMPORTANT]
@@ -24,7 +24,7 @@
 |--------|-------|
 | Python Core Features | 411 |
 | Python Wrapper Features | 21 |
-| TypeScript Features | 2018 |
+| TypeScript Features | 2040 |
 | **Gap Count** | **0** |
 | Stub Exported (parity shim only) | 0 |
 | P0 (Critical) | 0 |
@@ -735,10 +735,10 @@ from praisonaiagents import AgentFlow, If, Include, Loop, MAX_NESTING_DEPTH, Par
 **Path:** `src/praisonai-ts/src`
 
 <details>
-<summary><strong>agent</strong> (166 exports)</summary>
+<summary><strong>agent</strong> (169 exports)</summary>
 
 ```typescript
-import { AGENT_RUN_STATUSES, Agent, AgentChatOptions, AgentEvent, AgentGuardrailEntry, AgentGuardrailFunction, AgentGuardrailInput, AgentHooksInput, AgentMemoryStore, AgentMessage... } from 'praisonai';
+import { AGENT_RUN_STATUSES, Agent, AgentChatCallOptions, AgentChatOptions, AgentEvent, AgentExecuteTask, AgentGuardrailEntry, AgentGuardrailFunction, AgentGuardrailInput, AgentHooksInput... } from 'praisonai';
 ```
 
 </details>
@@ -969,7 +969,7 @@ import { AgentStats, AgentTelemetry, MetricEntry, MinimalTelemetry, PerformanceM
 </details>
 
 <details>
-<summary><strong>tools</strong> (120 exports)</summary>
+<summary><strong>tools</strong> (139 exports)</summary>
 
 ```typescript
 import { ArxivDownloadTool, ArxivPaper, ArxivSearchTool, BaseTool, BudgetExceededError, DelegatorConfig, FunctionTool, InstallHints, MCP, MCPTool... } from 'praisonai';
