@@ -15,10 +15,46 @@ The tests stub the *actual* runtime chat_main dispatches to -- the credential
 gate and the async TUI -- so a supplied option exercises the warning without
 depending on external state (an API key, a local endpoint, or a real TTY).
 """
+import ast
+from pathlib import Path
+
 import typer
 from typer.testing import CliRunner
 
 import praisonai_code.cli.commands.chat as chat_module
+
+
+# ``--pure``/``--no-plugins`` is consumed by the @scopes_no_plugins decorator
+# rather than by the body, so it is wired despite never being named inside.
+_WIRED_BY_DECORATOR = {"ctx", "pure"}
+
+
+def _chat_main_ast():
+    module = ast.parse(Path(chat_module.__file__).read_text())
+    return next(
+        n for n in ast.walk(module)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == "chat_main"
+    )
+
+
+def _chat_main_params():
+    a = _chat_main_ast().args
+    return [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs]
+
+
+def _names_read_by_chat_main():
+    """Names actually loaded somewhere in chat_main's body.
+
+    Only the body -- a parameter's default is a ``typer.Option(...)`` call that
+    mentions the flag string, not a read of the value.
+    """
+    return {
+        node.id
+        for stmt in _chat_main_ast().body
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Name)
+    }
 
 
 class _StubTUI:
@@ -100,28 +136,105 @@ class TestUnwiredChatOptions:
         """A warning must not become a failure."""
         assert _run(monkeypatch, "--theme", "dark").exit_code == 0
 
-    def test_every_listed_option_really_is_unread(self, monkeypatch):
-        """Guards the list itself against drifting as options get wired up.
+    def test_every_listed_option_really_is_unread(self):
+        """Guards the list against drifting as options get wired up.
 
-        If someone implements one of these, this test fails and tells them to
-        drop it from the table rather than leaving a false warning behind.
+        Uses the AST, not a regex over source lines: the line-matching version
+        failed the moment the word "output" appeared in one of chat_main's own
+        comments, which is the same class of bug it exists to catch.
         """
-        import inspect
-        import re
+        wired = set(chat_module._UNWIRED_CHAT_OPTIONS) & _names_read_by_chat_main()
+        assert not wired, (
+            f"now read by chat_main; drop from _UNWIRED_CHAT_OPTIONS so the "
+            f"warning stops lying: {sorted(wired)}"
+        )
 
-        src = inspect.getsource(chat_module.chat_main)
-        body = src[src.index("):"):]
-        for name in chat_module._UNWIRED_CHAT_OPTIONS:
-            uses = [
-                line for line in body.splitlines()
-                if re.search(rf"\b{re.escape(name)}\b", line)
-                and "_UNWIRED_CHAT_OPTIONS" not in line
-                and "_warn_about_unwired_options" not in line
-            ]
-            assert not uses, (
-                f"{name} is now read by chat_main; remove it from "
-                f"_UNWIRED_CHAT_OPTIONS so the warning stops lying"
-            )
+    def test_every_dropped_option_is_named_in_the_table(self):
+        """The table must cover the WHOLE gap, not a subset of it.
+
+        It listed four options while nine were silently dropped, so
+        `chat --tools web_search` was accepted, ignored, and never mentioned.
+        Any declared option chat_main never reads must either be wired or be
+        listed here.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        src = textwrap.dedent(inspect.getsource(chat_module.chat_main))
+        fn = next(
+            n for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.FunctionDef) and n.name == "chat_main"
+        )
+        defaults = fn.args.defaults
+        params = fn.args.args[len(fn.args.args) - len(defaults):]
+        declared = [
+            a.arg for a, d in zip(params, defaults)
+            if "typer.Option" in ast.unparse(d) or "typer.Argument" in ast.unparse(d)
+        ]
+        read = {
+            n.id for n in ast.walk(fn)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+        }
+        # `pure` is consumed by the @scopes_no_plugins decorator, which reads it
+        # out of **kwargs rather than from the body.
+        unread = [
+            p for p in declared
+            if p not in read and p != "pure"
+        ]
+        missing = [p for p in unread if p not in chat_module._UNWIRED_CHAT_OPTIONS]
+        assert not missing, (
+            f"chat declares and silently drops {missing}; wire them or add them "
+            f"to _UNWIRED_CHAT_OPTIONS so the user is told"
+        )
+
+
+class TestNewlyWiredOptions:
+    """--continue, --no-acp and --no-lsp were dropped; now they reach the TUI."""
+
+    def test_no_acp_disables_acp_on_the_config(self, monkeypatch):
+        _StubTUI.last_config = None
+        _run(monkeypatch, "--no-acp")
+        assert _StubTUI.last_config.enable_acp is False
+
+    def test_no_lsp_disables_lsp_on_the_config(self, monkeypatch):
+        _StubTUI.last_config = None
+        _run(monkeypatch, "--no-lsp")
+        assert _StubTUI.last_config.enable_lsp is False
+
+    def test_acp_and_lsp_stay_enabled_by_default(self, monkeypatch):
+        _StubTUI.last_config = None
+        _run(monkeypatch)
+        assert _StubTUI.last_config.enable_acp is True
+        assert _StubTUI.last_config.enable_lsp is True
+
+    def test_continue_resolves_the_last_session_onto_the_config(self, monkeypatch):
+        monkeypatch.setattr(
+            "praisonai_code.cli.state.project_sessions.find_last_session",
+            lambda *a, **k: "sess-123",
+        )
+        _StubTUI.last_config = None
+        _run(monkeypatch, "--continue")
+        assert _StubTUI.last_config.session_id == "sess-123"
+        assert _StubTUI.last_config.resume is True
+
+    def test_without_continue_no_session_is_resumed(self, monkeypatch):
+        monkeypatch.setattr(
+            "praisonai_code.cli.state.project_sessions.find_last_session",
+            lambda *a, **k: "sess-123",
+        )
+        _StubTUI.last_config = None
+        _run(monkeypatch)
+        assert _StubTUI.last_config.session_id is None
+        assert _StubTUI.last_config.resume is False
+
+    def test_none_of_them_trigger_the_unwired_warning(self, monkeypatch):
+        monkeypatch.setattr(
+            "praisonai_code.cli.state.project_sessions.find_last_session",
+            lambda *a, **k: "sess-123",
+        )
+        out = _run(monkeypatch, "--no-acp", "--no-lsp", "--continue").output
+        assert "does not implement" not in out
 
 
 class TestWiredCapabilityOptions:
