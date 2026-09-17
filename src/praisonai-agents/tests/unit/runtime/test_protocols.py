@@ -2,12 +2,32 @@
 
 import pytest
 from typing import AsyncIterator
+from praisonaiagents.runtime.capabilities import RuntimeCapabilityMatrix
 from praisonaiagents.runtime.protocols import AgentRuntimeProtocol, RuntimeConfig, RuntimeResult, RuntimeDelta
 
 
 class MockRuntime:
-    """Mock runtime implementation for testing protocol compliance."""
-    
+    """Mock runtime implementation for testing protocol compliance.
+
+    AgentRuntimeProtocol is @runtime_checkable, so isinstance() checks that
+    EVERY member is present. runtime_name, runtime_version and capabilities were
+    added to the protocol after this mock was written, so
+    test_protocol_compliance failed on a bare "assert False" -- the mock had
+    stopped implementing the protocol it exists to demonstrate.
+    """
+
+    @property
+    def runtime_name(self) -> str:
+        return "mock"
+
+    @property
+    def runtime_version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def capabilities(self) -> "RuntimeCapabilityMatrix":
+        return RuntimeCapabilityMatrix(basic_chat=True, simple_tools=True)
+
     def supports(self, model_ref: str = None) -> bool:
         return True
     
@@ -37,9 +57,9 @@ class MockRuntime:
     # AgentRuntimeProtocol grew beyond supports/run_turn/stream_turn to cover
     # identity, capability reporting and health, and this mock was not updated
     # -- so isinstance(runtime, AgentRuntimeProtocol) was correctly False and
-    # test_protocol_compliance had been red. A mock claiming to demonstrate
-    # protocol compliance has to actually implement the protocol, otherwise the
-    # test asserts nothing about the real contract.
+    # test_protocol_compliance had been red. A conformance fixture has to
+    # implement the whole surface, matching the real protocol's signatures,
+    # or the isinstance() check below silently stops meaning anything.
 
     @property
     def runtime_name(self) -> str:
@@ -49,22 +69,21 @@ class MockRuntime:
     def runtime_version(self) -> str:
         return "0.0.0"
 
-    @property
-    def capabilities(self):
-        return {}
+    def capabilities(self) -> "RuntimeCapabilityMatrix":
+        from praisonaiagents.runtime.protocols import RuntimeCapabilityMatrix
+        return RuntimeCapabilityMatrix()
 
-    def validate_config(self, config) -> bool:
-        return True
+    async def health_check(self) -> dict:
+        return {"status": "ok"}
 
-    def health_check(self) -> bool:
-        return True
+    async def validate_config(self, agent_config: dict) -> list:
+        return []
 
-    async def execute_agent(self, agent, prompt: str, **kwargs) -> RuntimeResult:
-        return await self.run_turn(prompt, **kwargs)
+    async def execute_agent(self, agent_config: dict, prompt: str, **kwargs) -> dict:
+        return {"content": f"Response to: {prompt}"}
 
-    async def stream_agent(self, agent, prompt: str, **kwargs) -> AsyncIterator[RuntimeDelta]:
-        async for delta in self.stream_turn(prompt, **kwargs):
-            yield delta
+    async def stream_agent(self, agent_config: dict, prompt: str, **kwargs):
+        yield RuntimeDelta(type="text", content=prompt)
 
 
 def test_runtime_config():
@@ -125,6 +144,10 @@ def test_protocol_compliance():
     assert hasattr(runtime, 'supports')
     assert hasattr(runtime, 'run_turn')
     assert hasattr(runtime, 'stream_turn')
+    for member in ('capabilities', 'health_check', 'validate_config',
+                   'execute_agent', 'stream_agent', 'runtime_name',
+                   'runtime_version'):
+        assert hasattr(runtime, member), f"missing protocol member: {member}"
 
 
 @pytest.mark.asyncio
